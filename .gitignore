@@ -16,3 +16,5 @@ MANIFEST
 *.orig
 windows/version.txt
 /.vscode
+*.parm
+fb_key.json
