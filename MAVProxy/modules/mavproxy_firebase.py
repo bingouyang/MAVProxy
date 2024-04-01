@@ -139,7 +139,7 @@ class firebase(mp_module.MPModule):
     def status(self):
         '''returns information about module'''
         self.status_callcount += 1
-        return("logged in: " + 'yes' if self.logged_in else 'no')
+        return("logged in: " + str(self.logged_in) + ", payload init: " + str(self.initial_data))
 
     def idle_task(self):
         '''called rapidly by mavproxy'''
@@ -214,16 +214,19 @@ class firebase(mp_module.MPModule):
                 self.pond_data['temp'].append(-1)
         # initialize data
         else:
-            # wait until sensor sends data
-            if self.drone_variables['p_DO'].get() and self.drone_variables['p_pres'].get():
-                if (self.initial_data['DO'] == 0) and (self.initial_data['pressure'] == 0):
+            if self.drone_variables.get('p_DO') and self.drone_variables.get('p_pres'):
+                if (self.initial_data['pressure'] == 0):
                     self.initial_data['DO'] = self.drone_variables['p_DO']
                     self.initial_data['pressure'] = self.drone_variables['p_pres']
+                    print("payload initialized")
 
     def send_pond_data(self):
         #get current location
         coord = [self.drone_variables['lon'], self.drone_variables['lat']]
         location = Point(coord)
+        #get last do measurement
+        print("last do")
+        last_do = self.pond_data['do'][-1] / self.initial_data['DO'] * 100
         #get current pond
         pond_id = "unknown"
         for i in self.pond_table:
@@ -232,7 +235,9 @@ class firebase(mp_module.MPModule):
                 break
 
         print("coordinates: ", coord, "location: ", pond_id)
+        print("last do: ", last_do)
         print(self.pond_data)
+
         #upload data to firebase
         if self.logged_in:
             message_time = time.strftime('%Y%m%d_%H:%M:%S', time.localtime(time.time()))
@@ -242,6 +247,7 @@ class firebase(mp_module.MPModule):
                     **self.pond_data}
             
             db.reference('LH_Farm/pond_' + pond_id + '/' + message_time + '/').set(data)
+            db.reference("LH_Farm/overview/pond_" + pond_id + '/last_do/').set(last_do)
             print("uploaded data")
 
 
