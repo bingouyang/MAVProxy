@@ -11,6 +11,7 @@ import os
 from pymavlink import mavutil
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
+import math
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -22,6 +23,9 @@ LANDED_STATE = {0:'unknown',
                 2:'in air',
                 3:'taking off',
                 4:'landing'}
+
+FLIGHT_MODE = {0:'Stabilize', 1:'Acro', 2:'AltHold', 3:'Auto', 4:'Guided', 5:'Loiter', 6:'RTL', 7:'Circle',
+               9:'Land', 11:'Drift', 13:'Sport', 14:'Flip', 15:'AutoTune', 16:'PosHold', 17:'Brake'}
 
 #### FIREBASE FUNCTIONS ####
 def login(key_dict):
@@ -177,10 +181,16 @@ class firebase(mp_module.MPModule):
             self.drone_variables['lon'] = m.lon/1e7
             self.drone_variables['alt'] = m.alt/1000
             self.drone_variables['hdg'] = m.hdg/100
+            self.drone_variables['vel'] = math.sqrt(m.vx**2 + m.vy**2 + m.vz**2)/100
         if m.get_type() == 'BATTERY_STATUS':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['voltage'] = m.voltages[0]/1000
-            self.drone_variables['currrent'] = m.current_battery/100
+            self.drone_variables['current'] = m.current_battery/100
+        if m.get_type() == 'HEARTBEAT':
+            mode = FLIGHT_MODE.get(m.custom_mode)
+            if not mode:
+                mode = 'unknown'
+            self.drone_variables['flight_mode'] = mode
 
     def handle_pond(self):        
         #get pressure
