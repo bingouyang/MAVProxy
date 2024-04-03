@@ -27,6 +27,8 @@ LANDED_STATE = {0:'unknown',
 FLIGHT_MODE = {0:'Stabilize', 1:'Acro', 2:'AltHold', 3:'Auto', 4:'Guided', 5:'Loiter', 6:'RTL', 7:'Circle',
                9:'Land', 11:'Drift', 13:'Sport', 14:'Flip', 15:'AutoTune', 16:'PosHold', 17:'Brake'}
 
+ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1'}
+
 #### FIREBASE FUNCTIONS ####
 def login(key_dict):
     """
@@ -67,6 +69,7 @@ class firebase(mp_module.MPModule):
         """Initialise module"""
         super(firebase, self).__init__(mpstate, "firebase", "")
         self.status_callcount = 0
+        self.drone_id = "UNKNOWN"
         self.logged_in = False
         self.firebase_update = time.time()
         self.payload_update = time.time()
@@ -143,7 +146,7 @@ class firebase(mp_module.MPModule):
     def status(self):
         '''returns information about module'''
         self.status_callcount += 1
-        return("logged in: " + str(self.logged_in) + ", payload init: " + str(self.initial_data))
+        return("logged in: " + str(self.logged_in) + ", payload init: " + str(self.initial_data) + ", drone id: ", self.drone_id)
 
     def idle_task(self):
         '''called rapidly by mavproxy'''
@@ -159,7 +162,7 @@ class firebase(mp_module.MPModule):
 
                 data = {"data":self.drone_variables, "time":periods}
                 #upload variables
-                db.reference('LH_Farm/drone/').set(data)
+                db.reference('LH_Farm/drone/' + self.drone_id + '/').set(data)
         
         # update pond data
         if (time.time() - self.payload_update) > 1:
@@ -172,25 +175,35 @@ class firebase(mp_module.MPModule):
         if m.get_type() == 'NAMED_VALUE_FLOAT':
             self.timers[m.get_type()] = time.time()
             self.drone_variables[m.name] = round(m.value,2)
-        if m.get_type() == 'EXTENDED_SYS_STATE':
+        elif m.get_type() == 'EXTENDED_SYS_STATE':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['flight_status'] = LANDED_STATE[m.landed_state]
-        if m.get_type() == 'GLOBAL_POSITION_INT':
+        elif m.get_type() == 'GLOBAL_POSITION_INT':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['lat'] = m.lat/1e7
             self.drone_variables['lon'] = m.lon/1e7
             self.drone_variables['alt'] = m.alt/1000
             self.drone_variables['hdg'] = m.hdg/100
-            self.drone_variables['vel'] = math.sqrt(m.vx**2 + m.vy**2 + m.vz**2)/100
-        if m.get_type() == 'BATTERY_STATUS':
+            self.drone_variables['vel'] = round(math.sqrt(m.vx**2 + m.vy**2 + m.vz**2)/100, 2)
+        elif m.get_type() == 'BATTERY_STATUS':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['voltage'] = m.voltages[0]/1000
             self.drone_variables['current'] = m.current_battery/100
-        if m.get_type() == 'HEARTBEAT':
+        elif m.get_type() == 'HEARTBEAT':
             mode = FLIGHT_MODE.get(m.custom_mode)
             if not mode:
                 mode = 'unknown'
             self.drone_variables['flight_mode'] = mode
+        elif m.get_type() == 'STATUSTEXT':
+            self.drone_variables['msg_severity'] = m.severity
+            self.drone_variables['msg'] = m.text
+
+            #handle unique id
+            msg = m.text.split(' ')
+            if msg[0] == 'CubeOrangePlus':
+                drone_id = " ".join(msg[1:])
+                if ID_LOOKUP.get(drone_id):
+                    self.drone_id = ID_LOOKUP[drone_id]
 
     def handle_pond(self):        
         #get pressure
@@ -254,6 +267,7 @@ class firebase(mp_module.MPModule):
             data = {"lat":coord[1], "lng":coord[0],
                     "init_do":self.initial_data['DO'],
                     "init_pressure":self.initial_data['pressure'],
+                    "drone_id":self.drone_id,
                     **self.pond_data}
             
             db.reference('LH_Farm/pond_' + pond_id + '/' + message_time + '/').set(data)
