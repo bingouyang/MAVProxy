@@ -27,7 +27,8 @@ LANDED_STATE = {0:'unknown',
 FLIGHT_MODE = {0:'Stabilize', 1:'Acro', 2:'AltHold', 3:'Auto', 4:'Guided', 5:'Loiter', 6:'RTL', 7:'Circle',
                9:'Land', 11:'Drift', 13:'Sport', 14:'Flip', 15:'AutoTune', 16:'PosHold', 17:'Brake'}
 
-ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1'}
+ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1',
+             '003F003F 30325115 33383839':'SPLASHY_2'}
 
 #### FIREBASE FUNCTIONS ####
 def login(key_dict):
