@@ -1,10 +1,7 @@
 #!/usr/bin/env python
-from MAVProxy.modules.lib import mp_module
-from MAVProxy.modules.lib import mp_util
-from MAVProxy.modules.lib import mp_settings
+from MAVProxy.modules.lib import mp_module, mp_util, mp_settings
 import firebase_admin
-from firebase_admin import db
-from firebase_admin import credentials
+from firebase_admin import db, credentials
 import time
 import json
 import os
@@ -12,6 +9,7 @@ from pymavlink import mavutil
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 import math
+from MAVProxy.modules.mavproxy_haucs import path_planner
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -65,10 +63,10 @@ def get_pond_table():
     
     return ponds
 
-class firebase(mp_module.MPModule):
+class haucs(mp_module.MPModule):
     def __init__(self, mpstate):
         """Initialise module"""
-        super(firebase, self).__init__(mpstate, "firebase", "")
+        super(haucs, self).__init__(mpstate, "haucs", "")
         self.status_callcount = 0
         self.drone_id = "UNKNOWN"
         self.logged_in = False
@@ -87,14 +85,14 @@ class firebase(mp_module.MPModule):
                           "temp":[]}
         self.initial_data = {"DO":0,
                              "pressure":0}
-        self.example_settings = mp_settings.MPSettings(
+        self.haucs_settings = mp_settings.MPSettings(
             [ ('verbose', bool, False),])
         
-        self.add_command('firebase', self.cmd_firebase, "firebase module", ['status','set (LOGSETTING)'])
+        self.add_command('haucs', self.cmd_haucs, "haucs module", ['status','set (LOGSETTING)'])
 
     def usage(self):
         '''show help on command line options'''
-        return "Usage: example <status|set>"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tgen_mission"
 
     def extended_sys_subscribe(self):
         self.master.mav.command_long_send(
@@ -111,14 +109,14 @@ class firebase(mp_module.MPModule):
             0
         )
 
-    def cmd_firebase(self, args):
+    def cmd_haucs(self, args):
         '''control behaviour of the module'''
         if len(args) == 0:
             print(self.usage())
         elif args[0] == "status":
             print(self.status())
         elif args[0] == "set":
-            self.example_settings.command(args[1:])
+            self.haucs_settings.command(args[1:])
         elif args[0] == "sub":
             print("subscribing ...")
             self.extended_sys_subscribe()
@@ -137,10 +135,26 @@ class firebase(mp_module.MPModule):
             logout(fb_app)
             print("logged out")
             self.logged_in = False
-        elif args[0] == "init":
+        elif args[0] == "payload_init":
             self.initial_data['DO'] = self.drone_variables['p_DO']
             self.initial_data['pressure'] = self.drone_variables['p_pres']
             print(self.initial_data)
+        elif args[0] == "gen_mission":
+            if len(args) != 6:
+                print("gen_mission source<.csv> output<.txt> alt<meters> land<True/False> delay<seconds>")
+                print('example:\nhaucs gen_mission points mission 15 True 30')
+            else:
+                if not self.drone_variables.get('lat'):
+                    print("PLANNING FAILED: no data from gps (check power, gps status, GCS messages)")
+                else:
+                    home = (self.drone_variables['lat'], self.drone_variables['lon'], self.drone_variables['alt'])
+                    input_file = args[1] + ".csv"
+                    output_file = args[2] + ".txt"
+                    alt =  int(args[3])
+                    land = bool(args[4])
+                    delay = int(args[5])
+                    print(input_file, output_file, alt, land, delay)
+                    path_planner.main(input_file, output_file, home, alt, land, delay)
         else:
             print(self.usage())
 
@@ -264,18 +278,25 @@ class firebase(mp_module.MPModule):
 
         #upload data to firebase
         if self.logged_in:
-            message_time = time.strftime('%Y%m%d_%H:%M:%S', time.localtime(time.time()))
+            message_time = time.strftime('%Y%m%d_%H:%M:%S', time.gmtime(time.time()))
             data = {"lat":coord[1], "lng":coord[0],
                     "init_do":self.initial_data['DO'],
                     "init_pressure":self.initial_data['pressure'],
                     "drone_id":self.drone_id,
+                    "type":"splashdrone",
                     **self.pond_data}
             
             db.reference('LH_Farm/pond_' + pond_id + '/' + message_time + '/').set(data)
             db.reference("LH_Farm/overview/pond_" + pond_id + '/last_do/').set(last_do)
+
+            #update recent
+            recent_data = db.reference('/LH_Farm/recent').order_by_key().limit_to_last(9).get()
+            recent_data[message_time] = data
+            db.reference('/LH_Farm/recent').set(recent_data)
+    
             print("uploaded data")
 
 
 def init(mpstate):
     '''initialise module'''
-    return firebase(mpstate)
+    return haucs(mpstate)
