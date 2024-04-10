@@ -7,6 +7,13 @@ from ortools.constraint_solver import pywrapcp
 ### https://developers.google.com/optimization/routing/tsp
 ###
 
+UAV_SPEED = {"WP_NAVSPEED": 1000,
+            # "RTL_SPEED": 0, set if different from WP_NAVSPEED
+            "LAND_SPEED": 50,
+            "WPNAV_SPEED_UP": 250}
+
+UAV_MAX_FTIME = 540 #seconds
+
 def geo_measure(lat1, lon1, lat2, lon2):
     """Converts GPS coordinates to distances"""
     R = 6_378_137;  #Radius of earth in meters
@@ -65,7 +72,7 @@ def print_solution(manager, routing, solution):
     """Prints solution on console."""
     indices = []
     index = routing.Start(0)
-    plan_output = "Route:\n"
+    plan_output = "route:\n"
     route_distance = 0
     while not routing.IsEnd(index):
         plan_output += f" {manager.IndexToNode(index)} ->"
@@ -89,15 +96,30 @@ def generate_mission(file, home, coords, alt, land, delay):
             lat = i[0]
             lon = i[1]
             m.write(f"0\t0\t0\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{alt}\t1\n") #nav_wp
-            if land:
+            if land == 'True':
                 m.write("0\t0\t0\t21\t0\t0\t0\t0\t0\t0\t0\t1\n") #land
-                if delay > 0:
-                    m.write(f"0\t0\t0\t93\t{delay}\t0\t0\t0\t0\t0\t0\t1\n") #delay
+            if delay > 0:
+                m.write(f"0\t0\t0\t93\t{delay}\t0\t0\t0\t0\t0\t0\t1\n") #delay
+            if land == 'True':
                 m.write(f"0\t0\t0\t22\t0\t0\t0\t0\t0\t0\t{alt}\t1\n") #takeoff
         #set return to launch and disarm
         m.write("0\t0\t0\t20\t0\t0\t0\t0\t0\t0\t0\t1\n") #RTL
         #disarm
         m.write("0\t0\t0\t218\t41\t0\t0\t0\t0\t0\t0\t1\n") #DISARM
+
+def estimate_missionTime(distance, wps, alt, land, delay):
+    flight_time = distance / UAV_SPEED["WP_NAVSPEED"] * 100 #moving time
+    if land == 'True':
+        flight_time += (wps + 1) * alt / UAV_SPEED["LAND_SPEED"] * 100 #landing time
+        flight_time += (wps + 1) * alt / UAV_SPEED["WPNAV_SPEED_UP"] * 100 #takeoff time
+        total_time = flight_time + (wps * delay)
+    else:
+        flight_time += alt / UAV_SPEED["LAND_SPEED"] * 100 #landing time
+        flight_time += alt / UAV_SPEED["WPNAV_SPEED_UP"] * 100 #takeoff time
+        flight_time += (wps * delay)
+        total_time = flight_time
+
+    return flight_time, total_time
 
 def main(source, output, home, alt, land, delay):
     """Entry point of the program."""
@@ -143,7 +165,11 @@ def main(source, output, home, alt, land, delay):
         sorted_coords = [data["coordinates"][i] for i in indices[:-1]]
         generate_mission(output, home, coords=sorted_coords, alt=alt, land=land, delay=delay)
         
-        if distance > 1_000:
-            print("ROUTE LENGTH WARNING: UAV may run out of battery")
+        flight_time, mission_time = estimate_missionTime(distance, len(indices) - 1, alt, land, delay)
+        if mission_time >= UAV_MAX_FTIME:
+            print("ROUTE SIZE WARNING: UAV may end mission early with low battery")
+        print(f"estimated mission time: {mission_time//60}mins {round(mission_time%60)}secs")
+        print(f" estimated flight time: {flight_time//60}mins {round(flight_time%60)}secs")
+        print(f"   max UAV flight time: {UAV_MAX_FTIME//60}mins {UAV_MAX_FTIME%60}secs")
     else:
         raise Exception('no solution found, try again ...')

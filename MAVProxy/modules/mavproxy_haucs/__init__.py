@@ -10,6 +10,7 @@ from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 import math
 from MAVProxy.modules.mavproxy_haucs import path_planner
+import webbrowser
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -140,21 +141,20 @@ class haucs(mp_module.MPModule):
             self.initial_data['pressure'] = self.drone_variables['p_pres']
             print(self.initial_data)
         elif args[0] == "gen_mission":
-            if len(args) != 6:
-                print("gen_mission source<.csv> output<.txt> alt<meters> land<True/False> delay<seconds>")
-                print('example:\nhaucs gen_mission points mission 15 True 30')
+            if len(args) == 7:
+                if args[6] == "test":
+                    print("TESTING GEN_MISSION")
+                    home = (27.535321985800824, -80.35167917904866, 0)
+                    print(args[1:5])
+                    self.gen_mission(home, args[1:6])
+            elif len(args) != 6:
+                print("gen_mission <source> (.csv) <output> (.txt) <alt> (meters) <delay> (seconds) <land> (True/False)")
+                print('example:\nhaucs gen_mission points mission 15 30 True')
             else:
                 if not self.drone_variables.get('lat'):
                     print("PLANNING FAILED: no data from gps (check power, gps status, GCS messages)")
                 else:
                     home = (self.drone_variables['lat'], self.drone_variables['lon'], self.drone_variables['alt'])
-                    input_file = args[1] + ".csv"
-                    output_file = args[2] + ".txt"
-                    alt =  int(args[3])
-                    land = bool(args[4])
-                    delay = int(args[5])
-                    print(input_file, output_file, alt, land, delay)
-                    path_planner.main(input_file, output_file, home, alt, land, delay)
         else:
             print(self.usage())
 
@@ -272,7 +272,7 @@ class haucs(mp_module.MPModule):
                 pond_id = str(i)
                 break
 
-        print("coordinates: ", coord, "location: ", pond_id)
+        print("sampled at: ", pond_id)
         print("last do: ", last_do)
         print(self.pond_data)
 
@@ -295,6 +295,15 @@ class haucs(mp_module.MPModule):
             db.reference('/LH_Farm/recent').set(recent_data)
     
             print("uploaded data")
+
+    def gen_mission(self, home, args):
+        input_file = args[0] + ".csv"
+        output_file = args[1] + ".txt"
+        alt =  int(args[2])
+        delay = int(args[3])
+        land = args[4]
+        print(f"output file: {output_file}\naltitude: {alt}\nland: {land}\ndelay: {delay}")
+        path_planner.main(input_file, output_file, home, alt, land, delay)
 
 
 def init(mpstate):
