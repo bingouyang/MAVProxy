@@ -145,7 +145,6 @@ class haucs(mp_module.MPModule):
                 if args[6] == "test":
                     print("TESTING GEN_MISSION")
                     home = (27.535321985800824, -80.35167917904866, 0)
-                    print(args[1:5])
                     self.gen_mission(home, args[1:6])
             elif len(args) != 6:
                 print("gen_mission <source> (.csv) <output> (.txt) <alt> (meters) <delay> (seconds) <land> (True/False)")
@@ -155,6 +154,7 @@ class haucs(mp_module.MPModule):
                     print("PLANNING FAILED: no data from gps (check power, gps status, GCS messages)")
                 else:
                     home = (self.drone_variables['lat'], self.drone_variables['lon'], self.drone_variables['alt'])
+                    self.gen_mission(home, args[1:])
         else:
             print(self.usage())
 
@@ -302,7 +302,7 @@ class haucs(mp_module.MPModule):
         alt =  int(args[2])
         delay = int(args[3])
         land = args[4]
-        print(f"output file: {output_file}\naltitude: {alt}\nland: {land}\ndelay: {delay}")
+        print(f"output file: {output_file}\n   altitude: {alt}\n      delay: {delay}\n       land: {land}")
         path_planner.main(input_file, output_file, home, alt, land, delay)
 
 

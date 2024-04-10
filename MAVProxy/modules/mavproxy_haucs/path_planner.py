@@ -72,7 +72,7 @@ def print_solution(manager, routing, solution):
     """Prints solution on console."""
     indices = []
     index = routing.Start(0)
-    plan_output = "route:\n"
+    plan_output = "\n"
     route_distance = 0
     while not routing.IsEnd(index):
         plan_output += f" {manager.IndexToNode(index)} ->"
@@ -81,31 +81,36 @@ def print_solution(manager, routing, solution):
         route_distance += routing.GetArcCostForVehicle(previous_index, index, 0)
         indices.append(index)
     plan_output += f" {manager.IndexToNode(index)}\n"
-    plan_output += f"distance: {route_distance}m"
+    print(f"   distance: {route_distance}m")
     print(plan_output)
+    
     return indices, route_distance
 
 def generate_mission(file, home, coords, alt, land, delay):
     #start with header and a takeoff
     with open(file,'w') as m:
         m.write('QGC WPL 110\n')
-        m.write(f"0\t0\t0\t16\t0\t0\t0\t0\t{home[0]}\t{home[1]}\t{home[2]}\t1\n") #set home
-        m.write(f"0\t0\t0\t22\t0\t0\t0\t0\t0\t0\t{alt}\t1\n") #takeoff
+        m.write(f"0\t1\t0\t16\t0\t0\t0\t0\t{home[0]}\t{home[1]}\t{home[2]}\t1\n") #set home
+        m.write(f"1\t0\t3\t22\t0\t0\t0\t0\t0\t0\t{alt}\t1\n") #takeoff
         #set each pond/waypoint
+        index = 1
         for i in coords:
             lat = i[0]
             lon = i[1]
-            m.write(f"0\t0\t0\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{alt}\t1\n") #nav_wp
+            index += 1
+            m.write(f"{index}\t0\t3\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{alt}\t1\n") #nav_wp
             if land == 'True':
-                m.write("0\t0\t0\t21\t0\t0\t0\t0\t0\t0\t0\t1\n") #land
+                index += 1
+                m.write(f"{index}\t0\t3\t21\t0\t0\t0\t0\t0\t0\t0\t1\n") #land       
             if delay > 0:
-                m.write(f"0\t0\t0\t93\t{delay}\t0\t0\t0\t0\t0\t0\t1\n") #delay
+                index += 1
+                m.write(f"{index}\t0\t3\t93\t{delay}\t0\t0\t0\t0\t0\t0\t1\n") #delay
             if land == 'True':
-                m.write(f"0\t0\t0\t22\t0\t0\t0\t0\t0\t0\t{alt}\t1\n") #takeoff
-        #set return to launch and disarm
-        m.write("0\t0\t0\t20\t0\t0\t0\t0\t0\t0\t0\t1\n") #RTL
-        #disarm
-        m.write("0\t0\t0\t218\t41\t0\t0\t0\t0\t0\t0\t1\n") #DISARM
+                index += 1
+                m.write(f"{index}\t0\t3\t22\t0\t0\t0\t0\t0\t0\t{alt}\t1\n") #takeoff
+
+        index += 1
+        m.write(f"{index}\t0\t3\t20\t0\t0\t0\t0\t0\t0\t0\t1\n") #RTL
 
 def estimate_missionTime(distance, wps, alt, land, delay):
     flight_time = distance / UAV_SPEED["WP_NAVSPEED"] * 100 #moving time
@@ -119,7 +124,7 @@ def estimate_missionTime(distance, wps, alt, land, delay):
         flight_time += (wps * delay)
         total_time = flight_time
 
-    return flight_time, total_time
+    return round(flight_time), round(total_time)
 
 def main(source, output, home, alt, land, delay):
     """Entry point of the program."""
@@ -164,12 +169,12 @@ def main(source, output, home, alt, land, delay):
         indices, distance = print_solution(manager, routing, solution)
         sorted_coords = [data["coordinates"][i] for i in indices[:-1]]
         generate_mission(output, home, coords=sorted_coords, alt=alt, land=land, delay=delay)
-        
         flight_time, mission_time = estimate_missionTime(distance, len(indices) - 1, alt, land, delay)
+        
+        print(f"estimated mission time: {mission_time//60}mins {mission_time%60}secs")
+        print(f" estimated flight time: {flight_time//60}mins {flight_time%60}secs")
+        print(f"   max UAV flight time: {UAV_MAX_FTIME//60}mins {UAV_MAX_FTIME%60}secs")
         if mission_time >= UAV_MAX_FTIME:
             print("ROUTE SIZE WARNING: UAV may end mission early with low battery")
-        print(f"estimated mission time: {mission_time//60}mins {round(mission_time%60)}secs")
-        print(f" estimated flight time: {flight_time//60}mins {round(flight_time%60)}secs")
-        print(f"   max UAV flight time: {UAV_MAX_FTIME//60}mins {UAV_MAX_FTIME%60}secs")
     else:
         raise Exception('no solution found, try again ...')
