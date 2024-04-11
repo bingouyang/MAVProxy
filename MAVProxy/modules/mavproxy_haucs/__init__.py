@@ -14,6 +14,7 @@ import webbrowser
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
+# mavproxy.py --master=/dev/cu.usbserial-B000G5WR  --aircraft=splashy
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy --out 172.20.10.5:14550
 # mavproxy.py --master=udp:127.0.0.1:14550 --aircraft=splashy
 
@@ -74,11 +75,13 @@ class haucs(mp_module.MPModule):
         self.firebase_update = time.time()
         self.payload_update = time.time()
         self.timers = {"NAMED_VALUE_FLOAT":time.time(),
-                       "EXTENDED_SYS_STATE":time.time(),
                        "BATTERY_STATUS":time.time(),
                        "GLOBAL_POSITION_INT":time.time()}
+        
         self.drone_variables = {"p_pres":0,
-                                "on_water":False}
+                                "on_water":False,
+                                "flight_time":0,
+                                "arm_state":"disarmed",}
         self.on_water = False
         self.pond_table = get_pond_table()
         self.pond_data = {"do":[],
@@ -95,20 +98,6 @@ class haucs(mp_module.MPModule):
         '''show help on command line options'''
         return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tgen_mission"
 
-    def extended_sys_subscribe(self):
-        self.master.mav.command_long_send(
-            self.target_system,
-            self.target_component,
-            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, # command
-            0, # confirmation
-            mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, # param1: message id
-            1000000, #param2: interval in microseconds
-            0,
-            0,
-            0,
-            0,
-            0
-        )
 
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
@@ -122,7 +111,6 @@ class haucs(mp_module.MPModule):
             print("subscribing ...")
             self.extended_sys_subscribe()
         elif args[0] == "login":
-            self.extended_sys_subscribe()
             with open('fb_key.json', 'r') as file:
                 fb_key = file.read()
             try:
@@ -166,8 +154,13 @@ class haucs(mp_module.MPModule):
     def idle_task(self):
         '''called rapidly by mavproxy'''
         # update firebase with drone status
-        if (time.time() - self.firebase_update) > 2:
+        last_update = time.time() - self.firebase_update
+        if (last_update) > 2:
             self.firebase_update = time.time()
+            #handle flight time
+            if self.drone_variables['arm_state'] == 'armed':
+                self.drone_variables['flight_time'] += last_update
+            #handle database update
             if self.logged_in:
                 #format time
                 periods = {}
@@ -190,9 +183,6 @@ class haucs(mp_module.MPModule):
         if m.get_type() == 'NAMED_VALUE_FLOAT':
             self.timers[m.get_type()] = time.time()
             self.drone_variables[m.name] = round(m.value,2)
-        elif m.get_type() == 'EXTENDED_SYS_STATE':
-            self.timers[m.get_type()] = time.time()
-            self.drone_variables['flight_status'] = LANDED_STATE[m.landed_state]
         elif m.get_type() == 'GLOBAL_POSITION_INT':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['lat'] = m.lat/1e7
@@ -205,14 +195,10 @@ class haucs(mp_module.MPModule):
             self.drone_variables['voltage'] = m.voltages[0]/1000
             self.drone_variables['current'] = m.current_battery/100
         elif m.get_type() == 'HEARTBEAT':
-            mode = FLIGHT_MODE.get(m.custom_mode)
-            if not mode:
-                mode = 'unknown'
-            self.drone_variables['flight_mode'] = mode
+            self.handle_heartbeat(m)
         elif m.get_type() == 'STATUSTEXT':
             self.drone_variables['msg_severity'] = m.severity
             self.drone_variables['msg'] = m.text
-
             #handle unique id
             msg = m.text.split(' ')
             if msg[0] == 'CubeOrangePlus':
@@ -263,7 +249,6 @@ class haucs(mp_module.MPModule):
         coord = [self.drone_variables['lon'], self.drone_variables['lat']]
         location = Point(coord)
         #get last do measurement
-        print("last do")
         last_do = self.pond_data['do'][-1] / self.initial_data['DO'] * 100
         #get current pond
         pond_id = "unknown"
@@ -273,7 +258,7 @@ class haucs(mp_module.MPModule):
                 break
 
         print("sampled at: ", pond_id)
-        print("last do: ", last_do)
+        print("   last do: ", last_do)
         print(self.pond_data)
 
         #upload data to firebase
@@ -295,6 +280,22 @@ class haucs(mp_module.MPModule):
             db.reference('/LH_Farm/recent').set(recent_data)
     
             print("uploaded data")
+    
+    def handle_heartbeat(self, m):
+        #flight mode
+        mode = FLIGHT_MODE.get(m.custom_mode)
+        if not mode:
+            mode = 'unknown'
+        self.drone_variables['flight_mode'] = mode
+        #arm status
+        if m.base_mode & 0b1000_0000:
+            #handle just armed
+            if self.drone_variables['arm_state'] == "disarmed":
+                self.drone_variables['flight_time'] = 0   
+            self.drone_variables['arm_state'] = "armed"
+        else:
+            self.drone_variables['arm_state'] = "disarmed"
+
 
     def gen_mission(self, home, args):
         input_file = args[0] + ".csv"
@@ -305,7 +306,16 @@ class haucs(mp_module.MPModule):
         print(f"output file: {output_file}\n   altitude: {alt}\n      delay: {delay}\n       land: {land}")
         path_planner.main(input_file, output_file, home, alt, land, delay)
 
-
+    def extended_sys_subscribe(self):
+        self.master.mav.command_long_send(
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, # command
+            0, # confirmation
+            mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, # param1: message id
+            1000000, #param2: interval in microseconds
+            0,0,0,0,0)
+        
 def init(mpstate):
     '''initialise module'''
     return haucs(mpstate)

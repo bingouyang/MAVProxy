@@ -7,10 +7,11 @@ from ortools.constraint_solver import pywrapcp
 ### https://developers.google.com/optimization/routing/tsp
 ###
 
-UAV_SPEED = {"WP_NAVSPEED": 1000,
-            # "RTL_SPEED": 0, set if different from WP_NAVSPEED
+UAV_SPEED = {"WPNAV_SPEED": 1000,
             "LAND_SPEED": 50,
-            "WPNAV_SPEED_UP": 250}
+            "WPNAV_SPEED_UP": 250,
+            "WPNAV_ACCEL":250,
+            "WPNAV_ACCEL_Z":100}
 
 UAV_MAX_FTIME = 540 #seconds
 
@@ -68,24 +69,6 @@ def create_data_model(file, home):
     data["coordinates"] = coords
     return data
 
-def print_solution(manager, routing, solution):
-    """Prints solution on console."""
-    indices = []
-    index = routing.Start(0)
-    plan_output = "\n"
-    route_distance = 0
-    while not routing.IsEnd(index):
-        plan_output += f" {manager.IndexToNode(index)} ->"
-        previous_index = index
-        index = solution.Value(routing.NextVar(index))
-        route_distance += routing.GetArcCostForVehicle(previous_index, index, 0)
-        indices.append(index)
-    plan_output += f" {manager.IndexToNode(index)}\n"
-    print(f"   distance: {route_distance}m")
-    print(plan_output)
-    
-    return indices, route_distance
-
 def generate_mission(file, home, coords, alt, land, delay):
     #start with header and a takeoff
     with open(file,'w') as m:
@@ -112,19 +95,86 @@ def generate_mission(file, home, coords, alt, land, delay):
         index += 1
         m.write(f"{index}\t0\t3\t20\t0\t0\t0\t0\t0\t0\t0\t1\n") #RTL
 
-def estimate_missionTime(distance, wps, alt, land, delay):
-    flight_time = distance / UAV_SPEED["WP_NAVSPEED"] * 100 #moving time
+def estimate_missionTime(distances, wps, alt, land, delay):
+    """
+    Estimates the mission time for a given waypoint misison
+    Includes:
+    - drone vertical/horizontal speeds
+    - drone vertical/horziontal accelerations
+    Does not include:
+    - wind speed
+    - cornering
+    - yaw rate
+    """
+    flight_time = 0
+
+    horz_accel_t = UAV_SPEED["WPNAV_SPEED"] / UAV_SPEED["WPNAV_ACCEL"]
+    horz_accel_d = UAV_SPEED["WPNAV_ACCEL"] / 100 * horz_accel_t**2 #distance to accel & deaccel
+
+    #calculate flight times between waypoints
+    for dist in distances:
+        #hits max velocity
+        if horz_accel_d < dist:
+            t = 2 * horz_accel_t + (dist - horz_accel_d) / UAV_SPEED["WPNAV_SPEED"] * 100
+        #stays below max velocity
+        else:
+            dist = dist / 2
+            t = 2 * math.sqrt(2 * dist / UAV_SPEED["WPNAV_ACCEL"] * 100)
+        flight_time += t  
+
+    #calculate takeoff time
+    vert_accel_t = UAV_SPEED["WPNAV_SPEED_UP"] / UAV_SPEED["WPNAV_ACCEL_Z"]
+    vert_accel_d = UAV_SPEED["WPNAV_ACCEL_Z"] / 100 * vert_accel_t**2
+    #hits max vertical velocity
+    if vert_accel_d < alt:
+        takeoff_time = 2 * vert_accel_t + (alt - vert_accel_d) / UAV_SPEED["WPNAV_SPEED_UP"] * 100
+    #stays below max vertical velocity
+    else:
+        dist = alt / 2
+        takeoff_time = 2 * math.sqrt(2 * dist / UAV_SPEED["WPNAV_SPEED_UP"] * 100)
+    
+    #calculate landing time
+    vert_accel_t = UAV_SPEED["LAND_SPEED"] / UAV_SPEED["WPNAV_ACCEL_Z"]
+    vert_accel_d = UAV_SPEED["WPNAV_ACCEL_Z"] / 100 * vert_accel_t**2
+    #hits max vertical velocity
+    if vert_accel_d < alt:
+        landing_time = 2 * vert_accel_t + (alt - vert_accel_d) / UAV_SPEED["LAND_SPEED"] * 100
+    #stays below max vertical velocity
+    else:
+        dist = alt / 2
+        takeoff_time = 2 * math.sqrt(2 * dist / UAV_SPEED["LAND_SPEED"] * 100)
+    #calculate number of landings and takeoffs and delay locations
     if land == 'True':
-        flight_time += (wps + 1) * alt / UAV_SPEED["LAND_SPEED"] * 100 #landing time
-        flight_time += (wps + 1) * alt / UAV_SPEED["WPNAV_SPEED_UP"] * 100 #takeoff time
+        landing_time = (wps + 1) * landing_time
+        takeoff_time = (wps + 1) * takeoff_time
+        flight_time +=  landing_time + takeoff_time
         total_time = flight_time + (wps * delay)
     else:
-        flight_time += alt / UAV_SPEED["LAND_SPEED"] * 100 #landing time
-        flight_time += alt / UAV_SPEED["WPNAV_SPEED_UP"] * 100 #takeoff time
-        flight_time += (wps * delay)
+        flight_time += landing_time  + takeoff_time + (wps * delay)
         total_time = flight_time
+ 
+    times = [round(total_time), round(flight_time), round(takeoff_time), round(landing_time)]
+    return times
 
-    return round(flight_time), round(total_time)
+def print_solution(manager, routing, solution):
+    """Prints solution on console."""
+    indices = []
+    index = routing.Start(0)
+    plan_output = "\n"
+    route_distances = []
+    route_distance = 0
+    while not routing.IsEnd(index):
+        plan_output += f" {manager.IndexToNode(index)} ->"
+        previous_index = index
+        index = solution.Value(routing.NextVar(index))
+        route_distances.append(routing.GetArcCostForVehicle(previous_index, index, 0))
+        route_distance += route_distances[-1]
+        indices.append(index)
+    plan_output += f" {manager.IndexToNode(index)}\n"
+    print(f"   distance: {route_distance}m")
+    print(plan_output)
+    
+    return indices, route_distances
 
 def main(source, output, home, alt, land, delay):
     """Entry point of the program."""
@@ -166,15 +216,18 @@ def main(source, output, home, alt, land, delay):
 
     # Print solution on console.
     if solution:
-        indices, distance = print_solution(manager, routing, solution)
+        indices, distances = print_solution(manager, routing, solution)
         sorted_coords = [data["coordinates"][i] for i in indices[:-1]]
         generate_mission(output, home, coords=sorted_coords, alt=alt, land=land, delay=delay)
-        flight_time, mission_time = estimate_missionTime(distance, len(indices) - 1, alt, land, delay)
+        mission_times = estimate_missionTime(distances, len(indices) - 1, alt, land, delay)
+
+        print(f"estimated mission time: {mission_times[0]//60:02d}:{mission_times[0]%60:02d} (mins:secs)")
+        print(f"           flight time: {mission_times[1]//60:02d}:{mission_times[1]%60:02d} (mins:secs)")
+        print(f"              takeoffs: {mission_times[2]//60:02d}:{mission_times[2]%60:02d} (mins:secs)")
+        print(f"              landings: {mission_times[3]//60:02d}:{mission_times[3]%60:02d} (mins:secs)")
         
-        print(f"estimated mission time: {mission_time//60}mins {mission_time%60}secs")
-        print(f" estimated flight time: {flight_time//60}mins {flight_time%60}secs")
-        print(f"   max UAV flight time: {UAV_MAX_FTIME//60}mins {UAV_MAX_FTIME%60}secs")
-        if mission_time >= UAV_MAX_FTIME:
+        print(f"   max UAV flight time: {UAV_MAX_FTIME//60:02d}:{UAV_MAX_FTIME%60:02d} (mins:secs)")
+        if mission_times[1] >= UAV_MAX_FTIME:
             print("ROUTE SIZE WARNING: UAV may end mission early with low battery")
     else:
         raise Exception('no solution found, try again ...')
