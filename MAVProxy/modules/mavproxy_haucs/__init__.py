@@ -11,6 +11,7 @@ from shapely.geometry.polygon import Polygon
 import math
 from MAVProxy.modules.mavproxy_haucs import path_planner
 import webbrowser
+# from MAVProxy.modules.mavproxy_haucs.oldwp import WPModule
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -129,14 +130,14 @@ class haucs(mp_module.MPModule):
             self.initial_data['pressure'] = self.drone_variables['p_pres']
             print(self.initial_data)
         elif args[0] == "gen_mission":
-            if len(args) == 7:
-                if args[6] == "test":
+            if len(args) == 6:
+                if args[5] == "test":
                     print("TESTING GEN_MISSION")
                     home = (27.535321985800824, -80.35167917904866, 0)
-                    self.gen_mission(home, args[1:6])
-            elif len(args) != 6:
-                print("gen_mission <source> (.csv) <output> (.txt) <alt> (meters) <delay> (seconds) <land> (True/False)")
-                print('example:\nhaucs gen_mission points mission 15 30 True')
+                    self.gen_mission(home, args[1:5])
+            elif len(args) != 5:
+                print("gen_mission <source> (.csv) <alt> (meters) <delay> (seconds) <land> (True/False)")
+                print('example:\nhaucs gen_mission points 15 30 True')
             else:
                 if not self.drone_variables.get('lat'):
                     print("PLANNING FAILED: no data from gps (check power, gps status, GCS messages)")
@@ -154,12 +155,11 @@ class haucs(mp_module.MPModule):
     def idle_task(self):
         '''called rapidly by mavproxy'''
         # update firebase with drone status
-        last_update = time.time() - self.firebase_update
-        if (last_update) > 2:
+        if (time.time() - self.firebase_update) > 2:
             self.firebase_update = time.time()
             #handle flight time
             if self.drone_variables['arm_state'] == 'armed':
-                self.drone_variables['flight_time'] += last_update
+                self.drone_variables['flight_time'] += 2
             #handle database update
             if self.logged_in:
                 #format time
@@ -299,12 +299,14 @@ class haucs(mp_module.MPModule):
 
     def gen_mission(self, home, args):
         input_file = args[0] + ".csv"
-        output_file = args[1] + ".txt"
-        alt =  int(args[2])
-        delay = int(args[3])
-        land = args[4]
+        output_file = args[0] + ".txt"
+        alt =  int(args[1])
+        delay = int(args[2])
+        land = args[3]
         print(f"output file: {output_file}\n   altitude: {alt}\n      delay: {delay}\n       land: {land}")
         path_planner.main(input_file, output_file, home, alt, land, delay)
+        # wpmodule = WPModule(self.target_system)
+        # wpmodule.load_waypoints(output_file)
 
     def extended_sys_subscribe(self):
         self.master.mav.command_long_send(
