@@ -1,17 +1,16 @@
 #!/usr/bin/env python
 from MAVProxy.modules.lib import mp_module, mp_util, mp_settings
+from MAVProxy.modules.mavproxy_haucs import path_planner
+from MAVProxy.modules.mavproxy_haucs.waypoint_helper import *
+from pymavlink import mavutil, mavwp
 import firebase_admin
 from firebase_admin import db, credentials
 import time
 import json
 import os
-from pymavlink import mavutil
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 import math
-from MAVProxy.modules.mavproxy_haucs import path_planner
-import webbrowser
-# from MAVProxy.modules.mavproxy_haucs.oldwp import WPModule
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -70,7 +69,6 @@ class haucs(mp_module.MPModule):
     def __init__(self, mpstate):
         """Initialise module"""
         super(haucs, self).__init__(mpstate, "haucs", "")
-        self.status_callcount = 0
         self.drone_id = "UNKNOWN"
         self.logged_in = False
         self.firebase_update = time.time()
@@ -81,7 +79,9 @@ class haucs(mp_module.MPModule):
         
         self.drone_variables = {"p_pres":0,
                                 "on_water":False,
+                                "battery_time":0,
                                 "flight_time":0,
+                                "mission_time":0,
                                 "arm_state":"disarmed",}
         self.on_water = False
         self.pond_table = get_pond_table()
@@ -90,11 +90,23 @@ class haucs(mp_module.MPModule):
                           "temp":[]}
         self.initial_data = {"DO":0,
                              "pressure":0}
+        #waypoints
+        self.wploader_by_sysid = {}
+        self.loading_waypoints = False
+        self.loading_waypoint_lasttime = time.time()
+
         self.haucs_settings = mp_settings.MPSettings(
             [ ('verbose', bool, False),])
-        
         self.add_command('haucs', self.cmd_haucs, "haucs module", ['status','set (LOGSETTING)'])
 
+    @property
+    def wploader(self):
+        '''per-sysid wploader'''
+        if self.target_system not in self.wploader_by_sysid:
+            self.wploader_by_sysid[self.target_system] = mavwp.MAVWPLoader()
+            self.wploader_by_sysid[self.target_system].expected_count = 0
+        return self.wploader_by_sysid[self.target_system]
+    
     def usage(self):
         '''show help on command line options'''
         return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tgen_mission"
@@ -149,8 +161,12 @@ class haucs(mp_module.MPModule):
 
     def status(self):
         '''returns information about module'''
-        self.status_callcount += 1
-        return("logged in: " + str(self.logged_in) + ", payload init: " + str(self.initial_data) + ", drone id: ", self.drone_id)
+        output = f"logged in: {self.logged_in}"
+        output += f"\npayload init: {self.initial_data}"
+        output += f"\ndrone id: {self.drone_id}"
+        for var in self.drone_variables:
+            output += f"\n{var}: {self.drone_variables[var]}"
+        return output
 
     def idle_task(self):
         '''called rapidly by mavproxy'''
@@ -159,7 +175,11 @@ class haucs(mp_module.MPModule):
             self.firebase_update = time.time()
             #handle flight time
             if self.drone_variables['arm_state'] == 'armed':
-                self.drone_variables['flight_time'] += 2
+                #only update is drone is flying
+                if self.drone_variables['current'] > 2:
+                    self.drone_variables['flight_time'] += 2
+                    self.drone_variables['battery_time'] += 2
+                self.drone_variables['mission_time'] += 2
             #handle database update
             if self.logged_in:
                 #format time
@@ -205,6 +225,8 @@ class haucs(mp_module.MPModule):
                 drone_id = " ".join(msg[1:])
                 if ID_LOOKUP.get(drone_id):
                     self.drone_id = ID_LOOKUP[drone_id]
+        elif m.get_type() in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
+            process_waypoint_request(self, m, self.master)
 
     def handle_pond(self):        
         #get pressure
@@ -292,6 +314,7 @@ class haucs(mp_module.MPModule):
             #handle just armed
             if self.drone_variables['arm_state'] == "disarmed":
                 self.drone_variables['flight_time'] = 0   
+                self.drone_variables['mission_time'] = 0   
             self.drone_variables['arm_state'] = "armed"
         else:
             self.drone_variables['arm_state'] = "disarmed"
@@ -303,10 +326,12 @@ class haucs(mp_module.MPModule):
         alt =  int(args[1])
         delay = int(args[2])
         land = args[3]
-        print(f"output file: {output_file}\n   altitude: {alt}\n      delay: {delay}\n       land: {land}")
-        path_planner.main(input_file, output_file, home, alt, land, delay)
-        # wpmodule = WPModule(self.target_system)
-        # wpmodule.load_waypoints(output_file)
+        if alt < 7:
+            print(f"ALTITUDE ERROR: {alt}m is too low, set alt >= 7m")
+        else:
+            print(f"output file: {output_file}\n   altitude: {alt}\n      delay: {delay}\n       land: {land}")
+            path_planner.main(input_file, output_file, home, alt, land, delay)
+            load_waypoints(self, output_file)
 
     def extended_sys_subscribe(self):
         self.master.mav.command_long_send(

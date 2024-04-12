@@ -144,7 +144,7 @@ def estimate_missionTime(distances, wps, alt, land, delay):
         dist = alt / 2
         takeoff_time = 2 * math.sqrt(2 * dist / UAV_SPEED["LAND_SPEED"] * 100)
     #calculate number of landings and takeoffs and delay locations
-    if land == 'True':
+    if (land == 'True') or (land == 'true'):
         landing_time = (wps + 1) * landing_time
         takeoff_time = (wps + 1) * takeoff_time
         flight_time +=  landing_time + takeoff_time
