@@ -10,7 +10,7 @@ from ortools.constraint_solver import pywrapcp
 UAV_SPEED = {"WPNAV_SPEED": 1000,
             "LAND_SPEED": 50,
             "WPNAV_SPEED_UP": 250,
-            "WPNAV_SPEED_DN": 250,
+            "WPNAV_SPEED_DN": 100,
             "WPNAV_ACCEL":250,
             "WPNAV_ACCEL_Z":100}
 
@@ -43,13 +43,6 @@ def compute_euclidean_distance_matrix(locations):
                 )
     return distances
 
-def distance_callback(from_index, to_index):
-    """Returns the distance between the two nodes."""
-    # Convert from routing variable Index to distance matrix NodeIndex.
-    from_node = manager.IndexToNode(from_index)
-    to_node = manager.IndexToNode(to_index)
-    return distance_matrix[from_node][to_node]
-
 def create_data_model(file, home):
     df = pd.read_csv(file)
 
@@ -72,7 +65,6 @@ def create_data_model(file, home):
 
 def generate_mission(args, coords):
     """Generates WP Mission Files.txt
-    TODO: Add navigate to low altitude, then land
     """
     home = args['home']
     alt = args['alt']
@@ -100,21 +92,25 @@ def generate_mission(args, coords):
             if delay > 0:
                 index += 1
                 m.write(f"{index}\t0\t3\t93\t{delay}\t0\t0\t0\t0\t0\t0\t1\n") #delay
-            if land == 'True':
+            if land == 'true':
                 index += 1
                 m.write(f"{index}\t0\t3\t22\t0\t0\t0\t0\t0\t0\t{alt}\t1\n") #takeoff
 
         index += 1
         m.write(f"{index}\t0\t3\t20\t0\t0\t0\t0\t0\t0\t0\t1\n") #RTL
 
-def estimate_missionTime(distances, wps, args):
+def estimate_missionTime(hmodule, distances, wps, args):
     """
-    TODO: MULTI-STAGE LANDINGS
     Estimates the mission time for a given waypoint misison
     Includes:
     - drone vertical/horizontal speeds
     - drone vertical/horziontal accelerations
+    - multi-speed landings
     """
+    # UAV parameters
+    for i in UAV_SPEED:
+        UAV_SPEED[i] = int(hmodule.get_mav_param(i))
+    # mission parameters
     land = args['land']
     delay = args['delay']
     alt = args['alt']
@@ -203,7 +199,7 @@ def print_solution(manager, routing, solution):
     
     return indices, route_distances
 
-def main(args):
+def main(hmodule, args):
     """Entry point of the program."""
     # Instantiate the data problem.
     data = create_data_model(args['source'], args['home'])
@@ -246,7 +242,7 @@ def main(args):
         indices, distances = print_solution(manager, routing, solution)
         sorted_coords = [data["coordinates"][i] for i in indices[:-1]]
         generate_mission(args, coords=sorted_coords)
-        mission_times = estimate_missionTime(distances, len(indices) - 1, args)
+        mission_times = estimate_missionTime(hmodule, distances, len(indices) - 1, args)
 
         print(f"estimated mission time: {mission_times[0]//60:02d}:{mission_times[0]%60:02d} (mins:secs)")
         print(f"           flight time: {mission_times[1]//60:02d}:{mission_times[1]%60:02d} (mins:secs)")

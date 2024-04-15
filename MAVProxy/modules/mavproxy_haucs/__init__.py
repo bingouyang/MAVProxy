@@ -155,7 +155,8 @@ class haucs(mp_module.MPModule):
             else:
                 if not self.drone_variables.get('lat'):
                     print("!!!TEST MODE!!!: no data from gps (check power, gps status, GCS messages)")
-                    test_home = (27.535321985800824, -80.35167917904866, 0)
+                    # test_home = (27.535321985800824, -80.35167917904866, 0) # lab
+                    test_home = (37.706386197905516, -89.45029871125445, 0) # logan hollow
                     self.gen_mission(test_home, 'true', args[1:])
                 else:
                     home = (self.drone_variables['lat'], self.drone_variables['lon'], self.drone_variables['alt'])
@@ -167,6 +168,7 @@ class haucs(mp_module.MPModule):
         '''returns information about module'''
         output =  f"      logged in: {self.logged_in}"
         output += f"\n   payload init: {self.initial_data}"
+        output += f"\npressure thrhld: {self.pressure_threshold}"
         output += f"\n       drone id: {self.drone_id}"
         for var in self.drone_variables:
             output += '\n{0: >15}: '.format(var) + str(self.drone_variables[var])
@@ -226,6 +228,7 @@ class haucs(mp_module.MPModule):
             #handle unique id
             msg = m.text.split(' ')
             if msg[0] == 'CubeOrangePlus':
+                self.drone_variables['battery_time'] = 0
                 drone_id = " ".join(msg[1:])
                 if ID_LOOKUP.get(drone_id):
                     self.drone_id = ID_LOOKUP[drone_id]
@@ -350,7 +353,7 @@ class haucs(mp_module.MPModule):
         else:
             for i in mission_args:
                 print('{0: >10}: '.format(i) + str(mission_args[i]))
-            path_planner.main(mission_args)
+            path_planner.main(self, mission_args)
             if testing == 'false':
                 load_waypoints(self, mission_args['output'])
 
