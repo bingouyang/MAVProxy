@@ -88,6 +88,7 @@ class haucs(mp_module.MPModule):
         self.pond_data = {"do":[],
                           "pressure":[],
                           "temp":[]}
+        self.pressure_threshold = 1024
         self.initial_data = {"DO":0,
                              "pressure":0}
         #waypoints
@@ -109,7 +110,7 @@ class haucs(mp_module.MPModule):
     
     def usage(self):
         '''show help on command line options'''
-        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tgen_mission"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tset_threshold\n\tgen_mission"
 
 
     def cmd_haucs(self, args):
@@ -141,31 +142,34 @@ class haucs(mp_module.MPModule):
             self.initial_data['DO'] = self.drone_variables['p_DO']
             self.initial_data['pressure'] = self.drone_variables['p_pres']
             print(self.initial_data)
+        elif args[0] == "set_threshold":
+            if len(args) != 2:
+                print(f"set pressure threshold to trigger on-water sampling\nset to {self.pressure_threshold}")
+            else:
+                self.pressure_threshold = float(args[1])
+                print(f"pressure threshold changed to {self.pressure_threshold}")
         elif args[0] == "gen_mission":
-            if len(args) == 6:
-                if args[5] == "test":
-                    print("TESTING GEN_MISSION")
-                    home = (27.535321985800824, -80.35167917904866, 0)
-                    self.gen_mission(home, args[1:5])
-            elif len(args) != 5:
-                print("gen_mission <source> (.csv) <alt> (meters) <delay> (seconds) <land> (True/False)")
-                print('example:\nhaucs gen_mission points 15 30 True')
+            if len(args) != 6:
+                print("gen_mission <source> (.csv) <alt> (meters) <delay> (seconds) <land> (True/False) <dive> (0 < x < alt)")
+                print('example:\nhaucs gen_mission points 15 30 True 5')
             else:
                 if not self.drone_variables.get('lat'):
-                    print("PLANNING FAILED: no data from gps (check power, gps status, GCS messages)")
+                    print("!!!TEST MODE!!!: no data from gps (check power, gps status, GCS messages)")
+                    test_home = (27.535321985800824, -80.35167917904866, 0)
+                    self.gen_mission(test_home, 'true', args[1:])
                 else:
                     home = (self.drone_variables['lat'], self.drone_variables['lon'], self.drone_variables['alt'])
-                    self.gen_mission(home, args[1:])
+                    self.gen_mission(home, 'false', args[1:])
         else:
             print(self.usage())
 
     def status(self):
         '''returns information about module'''
-        output = f"logged in: {self.logged_in}"
-        output += f"\npayload init: {self.initial_data}"
-        output += f"\ndrone id: {self.drone_id}"
+        output =  f"      logged in: {self.logged_in}"
+        output += f"\n   payload init: {self.initial_data}"
+        output += f"\n       drone id: {self.drone_id}"
         for var in self.drone_variables:
-            output += f"\n{var}: {self.drone_variables[var]}"
+            output += '\n{0: >15}: '.format(var) + str(self.drone_variables[var])
         return output
 
     def idle_task(self):
@@ -233,7 +237,7 @@ class haucs(mp_module.MPModule):
         pressure = self.drone_variables['p_pres']
         #set water state
         prev_on_water = self.drone_variables['on_water']
-        if pressure >1024:
+        if pressure >self.pressure_threshold:
             self.drone_variables['on_water'] = True
         else:
             self.drone_variables['on_water'] = False
@@ -264,6 +268,7 @@ class haucs(mp_module.MPModule):
                 if (self.initial_data['pressure'] == 0):
                     self.initial_data['DO'] = self.drone_variables['p_DO']
                     self.initial_data['pressure'] = self.drone_variables['p_pres']
+                    self.pressure_threshold = self.initial_data['pressure'] + 11
                     print("payload initialized")
 
     def send_pond_data(self):
@@ -320,18 +325,34 @@ class haucs(mp_module.MPModule):
             self.drone_variables['arm_state'] = "disarmed"
 
 
-    def gen_mission(self, home, args):
-        input_file = args[0] + ".csv"
-        output_file = args[0] + ".txt"
-        alt =  int(args[1])
-        delay = int(args[2])
-        land = args[3]
-        if alt < 7:
-            print(f"ALTITUDE ERROR: {alt}m is too low, set alt >= 7m")
+    def gen_mission(self, home, testing, args):
+        mission_args = {"home": home}
+        if args[0][-4:] != ".csv":
+            mission_args['source'] = args[0] + ".csv"
+            mission_args['output'] = args[0] + ".txt"
         else:
-            print(f"output file: {output_file}\n   altitude: {alt}\n      delay: {delay}\n       land: {land}")
-            path_planner.main(input_file, output_file, home, alt, land, delay)
-            load_waypoints(self, output_file)
+            mission_args['output'] = args[0:-4] + ".txt"
+
+        if testing == 'true':
+            mission_args['output'] = "test_" + mission_args['output']
+        
+        mission_args['alt'] =  int(args[1])
+        mission_args['delay'] = int(args[2])
+        mission_args['land'] = args[3].lower()
+
+        if (int(args[4]) > mission_args['alt']) or (int(args[4]) <= 0):
+            mission_args['dive'] = 15
+        else:
+            mission_args['dive'] = int(args[4])
+
+        if mission_args['alt'] < 7:
+            print(f"ALTITUDE ERROR: {mission_args['alt']}m is too low, set alt >= 7m")
+        else:
+            for i in mission_args:
+                print('{0: >10}: '.format(i) + str(mission_args[i]))
+            path_planner.main(mission_args)
+            if testing == 'false':
+                load_waypoints(self, mission_args['output'])
 
     def extended_sys_subscribe(self):
         self.master.mav.command_long_send(

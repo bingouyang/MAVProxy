@@ -10,6 +10,7 @@ from ortools.constraint_solver import pywrapcp
 UAV_SPEED = {"WPNAV_SPEED": 1000,
             "LAND_SPEED": 50,
             "WPNAV_SPEED_UP": 250,
+            "WPNAV_SPEED_DN": 250,
             "WPNAV_ACCEL":250,
             "WPNAV_ACCEL_Z":100}
 
@@ -69,9 +70,17 @@ def create_data_model(file, home):
     data["coordinates"] = coords
     return data
 
-def generate_mission(file, home, coords, alt, land, delay):
+def generate_mission(args, coords):
+    """Generates WP Mission Files.txt
+    TODO: Add navigate to low altitude, then land
+    """
+    home = args['home']
+    alt = args['alt']
+    delay = args['delay']
+    dive = args['dive']
+    land = args['land']
     #start with header and a takeoff
-    with open(file,'w') as m:
+    with open(args['output'],'w') as m:
         m.write('QGC WPL 110\n')
         m.write(f"0\t1\t0\t16\t0\t0\t0\t0\t{home[0]}\t{home[1]}\t{home[2]}\t1\n") #set home
         m.write(f"1\t0\t3\t22\t0\t0\t0\t0\t0\t0\t{alt}\t1\n") #takeoff
@@ -82,7 +91,10 @@ def generate_mission(file, home, coords, alt, land, delay):
             lon = i[1]
             index += 1
             m.write(f"{index}\t0\t3\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{alt}\t1\n") #nav_wp
-            if land == 'True':
+            if land == 'true':
+                if dive != alt:
+                    index += 1
+                    m.write(f"{index}\t0\t3\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{dive}\t1\n") #dive low
                 index += 1
                 m.write(f"{index}\t0\t3\t21\t0\t0\t0\t0\t0\t0\t0\t1\n") #land       
             if delay > 0:
@@ -95,17 +107,19 @@ def generate_mission(file, home, coords, alt, land, delay):
         index += 1
         m.write(f"{index}\t0\t3\t20\t0\t0\t0\t0\t0\t0\t0\t1\n") #RTL
 
-def estimate_missionTime(distances, wps, alt, land, delay):
+def estimate_missionTime(distances, wps, args):
     """
+    TODO: MULTI-STAGE LANDINGS
     Estimates the mission time for a given waypoint misison
     Includes:
     - drone vertical/horizontal speeds
     - drone vertical/horziontal accelerations
-    Does not include:
-    - wind speed
-    - cornering
-    - yaw rate
     """
+    land = args['land']
+    delay = args['delay']
+    alt = args['alt']
+    dive = args['dive']
+
     flight_time = 0
 
     horz_accel_t = UAV_SPEED["WPNAV_SPEED"] / UAV_SPEED["WPNAV_ACCEL"]
@@ -133,19 +147,32 @@ def estimate_missionTime(distances, wps, alt, land, delay):
         dist = alt / 2
         takeoff_time = 2 * math.sqrt(2 * dist / UAV_SPEED["WPNAV_SPEED_UP"] * 100)
     
+    #calculate dive time
+    vert_accel_t = UAV_SPEED["WPNAV_SPEED_DN"] / UAV_SPEED["WPNAV_ACCEL_Z"]
+    vert_accel_d = UAV_SPEED["WPNAV_ACCEL_Z"] / 100 * vert_accel_t**2
+    #hits max vertical velocity
+    if vert_accel_d < (alt - dive):
+        landing_time = 2 * vert_accel_t + ((alt - dive) - vert_accel_d) / UAV_SPEED["WPNAV_SPEED_DN"] * 100
+    #stays below max vertical velocity
+    else:
+        dist = (alt - dive) / 2
+        landing_time = 2 * math.sqrt(2 * dist / UAV_SPEED["WPNAV_SPEED_DN"] * 100)
+
     #calculate landing time
     vert_accel_t = UAV_SPEED["LAND_SPEED"] / UAV_SPEED["WPNAV_ACCEL_Z"]
     vert_accel_d = UAV_SPEED["WPNAV_ACCEL_Z"] / 100 * vert_accel_t**2
     #hits max vertical velocity
-    if vert_accel_d < alt:
-        landing_time = 2 * vert_accel_t + (alt - vert_accel_d) / UAV_SPEED["LAND_SPEED"] * 100
+    if vert_accel_d < dive:
+        landing_time += 2 * vert_accel_t + (dive - vert_accel_d) / UAV_SPEED["LAND_SPEED"] * 100
     #stays below max vertical velocity
     else:
-        dist = alt / 2
-        takeoff_time = 2 * math.sqrt(2 * dist / UAV_SPEED["LAND_SPEED"] * 100)
+        dist = dive / 2
+        landing_time += 2 * math.sqrt(2 * dist / UAV_SPEED["LAND_SPEED"] * 100)
     #calculate number of landings and takeoffs and delay locations
-    if (land == 'True') or (land == 'true'):
-        landing_time = (wps + 1) * landing_time
+    if land == 'true':
+        landing_time = (wps) * landing_time
+        #final landing time
+        landing_time += 2 * vert_accel_t + (alt - vert_accel_d) / UAV_SPEED["LAND_SPEED"] * 100
         takeoff_time = (wps + 1) * takeoff_time
         flight_time +=  landing_time + takeoff_time
         total_time = flight_time + (wps * delay)
@@ -171,15 +198,15 @@ def print_solution(manager, routing, solution):
         route_distance += route_distances[-1]
         indices.append(index)
     plan_output += f" {manager.IndexToNode(index)}\n"
-    print(f"   distance: {route_distance}m")
+    print(f"  distance: {route_distance}m")
     print(plan_output)
     
     return indices, route_distances
 
-def main(source, output, home, alt, land, delay):
+def main(args):
     """Entry point of the program."""
     # Instantiate the data problem.
-    data = create_data_model(source, home)
+    data = create_data_model(args['source'], args['home'])
 
     # Create the routing index manager.
     manager = pywrapcp.RoutingIndexManager(
@@ -218,8 +245,8 @@ def main(source, output, home, alt, land, delay):
     if solution:
         indices, distances = print_solution(manager, routing, solution)
         sorted_coords = [data["coordinates"][i] for i in indices[:-1]]
-        generate_mission(output, home, coords=sorted_coords, alt=alt, land=land, delay=delay)
-        mission_times = estimate_missionTime(distances, len(indices) - 1, alt, land, delay)
+        generate_mission(args, coords=sorted_coords)
+        mission_times = estimate_missionTime(distances, len(indices) - 1, args)
 
         print(f"estimated mission time: {mission_times[0]//60:02d}:{mission_times[0]%60:02d} (mins:secs)")
         print(f"           flight time: {mission_times[1]//60:02d}:{mission_times[1]%60:02d} (mins:secs)")
