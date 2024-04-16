@@ -73,10 +73,10 @@ class haucs(mp_module.MPModule):
         self.logged_in = False
         self.firebase_update = time.time()
         self.payload_update = time.time()
+        self.time_boot_ms = 0
         self.timers = {"NAMED_VALUE_FLOAT":time.time(),
                        "BATTERY_STATUS":time.time(),
                        "GLOBAL_POSITION_INT":time.time()}
-        
         self.drone_variables = {"p_pres":0,
                                 "on_water":False,
                                 "battery_time":0,
@@ -189,14 +189,13 @@ class haucs(mp_module.MPModule):
             #handle database update
             if self.logged_in:
                 #format time
-                periods = {}
+                self.drone_variables['timers'] = {}
                 for i in self.timers:
                     period = time.time() - self.timers[i]
-                    periods[i] = round(period, 2)
+                    self.drone_variables['timers'][i] = round(period, 2)
 
-                data = {"data":self.drone_variables, "time":periods}
                 #upload variables
-                db.reference('LH_Farm/drone/' + self.drone_id + '/').set(data)
+                db.reference('LH_Farm/drone/' + self.drone_id + '/data').set(self.drone_variables)
         
         # update pond data
         if (time.time() - self.payload_update) > 1:
@@ -228,10 +227,15 @@ class haucs(mp_module.MPModule):
             #handle unique id
             msg = m.text.split(' ')
             if msg[0] == 'CubeOrangePlus':
-                self.drone_variables['battery_time'] = 0
                 drone_id = " ".join(msg[1:])
                 if ID_LOOKUP.get(drone_id):
                     self.drone_id = ID_LOOKUP[drone_id]
+        elif m.get_type() == 'SYSTEM_TIME':
+            if m.time_boot_ms < self.time_boot_ms:
+                print("REBOOT DETECTED")
+                self.drone_variables['battery_time'] = 0
+            self.time_boot_ms = m.time_boot_ms
+
         elif m.get_type() in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
             process_waypoint_request(self, m, self.master)
 
@@ -353,9 +357,16 @@ class haucs(mp_module.MPModule):
         else:
             for i in mission_args:
                 print('{0: >10}: '.format(i) + str(mission_args[i]))
-            path_planner.main(self, mission_args)
+            #get sorted coords
+            sorted_coords = path_planner.main(self, mission_args)
             if testing == 'false':
+                #load to drone
                 load_waypoints(self, mission_args['output'])
+                #load to website
+                # sorted_coords = {str(i) : [sorted_coords[i][0], sorted_coords[i][1]] for i in range(len(sorted_coords))}
+                db.reference('LH_Farm/drone/' + self.drone_id + '/mission/').set(sorted_coords)
+                print('LH_Farm/drone/' + self.drone_id + '/mission/')
+                print("uploading points", sorted_coords)
 
     def extended_sys_subscribe(self):
         self.master.mav.command_long_send(

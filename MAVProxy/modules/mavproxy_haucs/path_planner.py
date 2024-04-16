@@ -252,5 +252,7 @@ def main(hmodule, args):
         print(f"   max UAV flight time: {UAV_MAX_FTIME//60:02d}:{UAV_MAX_FTIME%60:02d} (mins:secs)")
         if mission_times[1] >= UAV_MAX_FTIME:
             print("ROUTE SIZE WARNING: UAV may end mission early with low battery")
+
+        return sorted_coords
     else:
         raise Exception('no solution found, try again ...')
