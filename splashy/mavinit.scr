@@ -1,2 +1,3 @@
 set shownoise false
 module load haucs
+haucs login

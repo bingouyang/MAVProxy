@@ -4,13 +4,14 @@ from MAVProxy.modules.mavproxy_haucs import path_planner
 from MAVProxy.modules.mavproxy_haucs.waypoint_helper import *
 from pymavlink import mavutil, mavwp
 import firebase_admin
-from firebase_admin import db, credentials
+from firebase_admin import db, credentials, exceptions
 import time
 import json
 import os
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 import math
+import threading
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -72,11 +73,13 @@ class haucs(mp_module.MPModule):
         self.drone_id = "UNKNOWN"
         self.logged_in = False
         self.firebase_update = time.time()
+        self.firebase_thread = False
         self.payload_update = time.time()
         self.time_boot_ms = 0
         self.timers = {"NAMED_VALUE_FLOAT":time.time(),
                        "BATTERY_STATUS":time.time(),
-                       "GLOBAL_POSITION_INT":time.time()}
+                       "GLOBAL_POSITION_INT":time.time(),
+                       "GCS_HBEAT":time.time()}
         self.drone_variables = {"p_pres":0,
                                 "on_water":False,
                                 "battery_time":0,
@@ -195,7 +198,12 @@ class haucs(mp_module.MPModule):
                     self.drone_variables['timers'][i] = round(period, 2)
 
                 #upload variables
-                db.reference('LH_Farm/drone/' + self.drone_id + '/data').set(self.drone_variables)
+                if not self.firebase_thread:
+                    self.firebase_thread = True
+                    db_thread = threading.Thread(target=self.idle_firebase_update, args=(self.drone_variables.copy(),))
+                    db_thread.start()
+
+
         
         # update pond data
         if (time.time() - self.payload_update) > 1:
@@ -305,15 +313,17 @@ class haucs(mp_module.MPModule):
                     "type":"splashdrone",
                     **self.pond_data}
             
-            db.reference('LH_Farm/pond_' + pond_id + '/' + message_time + '/').set(data)
-            db.reference("LH_Farm/overview/pond_" + pond_id + '/last_do/').set(last_do)
+            try:
+                db.reference('LH_Farm/pond_' + pond_id + '/' + message_time + '/').set(data)
+                db.reference("LH_Farm/overview/pond_" + pond_id + '/last_do/').set(last_do)
 
-            #update recent
-            recent_data = db.reference('/LH_Farm/recent').order_by_key().limit_to_last(9).get()
-            recent_data[message_time] = data
-            db.reference('/LH_Farm/recent').set(recent_data)
-    
-            print("uploaded data")
+                #update recent
+                recent_data = db.reference('/LH_Farm/recent').order_by_key().limit_to_last(9).get()
+                recent_data[message_time] = data
+                db.reference('/LH_Farm/recent').set(recent_data)
+                print("uploaded data")
+            except:
+                print("UPLOAD FAILED: likely no internet connection")
     
     def handle_heartbeat(self, m):
         #flight mode
@@ -331,6 +341,12 @@ class haucs(mp_module.MPModule):
         else:
             self.drone_variables['arm_state'] = "disarmed"
 
+    def idle_firebase_update(self, data):     
+        try:
+            db.reference('LH_Farm/drone/' + self.drone_id + '/data').set(data)
+        except:
+            print("FAILED FIREBASE UPDATE: no internet likely cause")
+        self.firebase_thread = False
 
     def gen_mission(self, home, testing, args):
         mission_args = {"home": home}
