@@ -113,7 +113,7 @@ class haucs(mp_module.MPModule):
     
     def usage(self):
         '''show help on command line options'''
-        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tset_threshold\n\tgen_mission"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tgen_mission\n\tset_threshold\n\tset_id"
 
 
     def cmd_haucs(self, args):
@@ -151,6 +151,11 @@ class haucs(mp_module.MPModule):
             else:
                 self.pressure_threshold = float(args[1])
                 print(f"pressure threshold changed to {self.pressure_threshold}")
+        elif args[0] == "set_id":
+            if len(args) != 2:
+                print("set drone id\nexample: haucs set_id SPLASHY_1")
+            else:
+                self.drone_id = args[1]
         elif args[0] == "gen_mission":
             if len(args) != 6:
                 print("gen_mission <source> (.csv) <alt> (meters) <delay> (seconds) <land> (True/False) <dive> (0 < x < alt)")
@@ -227,6 +232,9 @@ class haucs(mp_module.MPModule):
             self.timers[m.get_type()] = time.time()
             self.drone_variables['voltage'] = m.voltages[0]/1000
             self.drone_variables['current'] = m.current_battery/100
+            self.drone_variables['mah_consumed'] = m.current_consumed
+            self.drone_variables['battery_remaining'] = m.battery_remaining
+            self.drone_variables['time_remaining'] = m.time_remaining
         elif m.get_type() == 'HEARTBEAT':
             self.handle_heartbeat(m)
         elif m.get_type() == 'STATUSTEXT':
