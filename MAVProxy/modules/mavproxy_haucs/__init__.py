@@ -164,7 +164,10 @@ class haucs(mp_module.MPModule):
                 if not self.drone_variables.get('lat'):
                     print("!!!TEST MODE!!!: no data from gps (check power, gps status, GCS messages)")
                     # test_home = (27.535321985800824, -80.35167917904866, 0) # lab
-                    test_home = (37.706386197905516, -89.45029871125445, 0) # logan hollow
+                    # test_home = (37.706386197905516, -89.45029871125445, 0) # logan hollow
+                    test_home = (37.70852528763561,  -89.45354741670316, 0)
+                   
+          
                     self.gen_mission(test_home, 'true', args[1:])
                 else:
                     home = (self.drone_variables['lat'], self.drone_variables['lon'], self.drone_variables['alt'])
@@ -174,26 +177,27 @@ class haucs(mp_module.MPModule):
 
     def status(self):
         '''returns information about module'''
-        output =  f"      logged in: {self.logged_in}"
-        output += f"\n   payload init: {self.initial_data}"
-        output += f"\npressure thrhld: {self.pressure_threshold}"
-        output += f"\n       drone id: {self.drone_id}"
+        output =  f"\n        logged in: {self.logged_in}"
+        output += f"\n     payload init: {self.initial_data}"
+        output += f"\n  pressure thrhld: {self.pressure_threshold}"
+        output += f"\n         drone id: {self.drone_id}"
         for var in self.drone_variables:
-            output += '\n{0: >15}: '.format(var) + str(self.drone_variables[var])
+            output += '\n{0: >17}: '.format(var) + str(self.drone_variables[var])
         return output
 
     def idle_task(self):
         '''called rapidly by mavproxy'''
         # update firebase with drone status
-        if (time.time() - self.firebase_update) > 2:
+        update_time = 1
+        if (time.time() - self.firebase_update) > update_time:
             self.firebase_update = time.time()
             #handle flight time
             if self.drone_variables['arm_state'] == 'armed':
                 #only update is drone is flying
                 if self.drone_variables['current'] > 2:
-                    self.drone_variables['flight_time'] += 2
-                    self.drone_variables['battery_time'] += 2
-                self.drone_variables['mission_time'] += 2
+                    self.drone_variables['flight_time'] += update_time
+                    self.drone_variables['battery_time'] += update_time
+                self.drone_variables['mission_time'] += update_time
             #handle database update
             if self.logged_in:
                 #format time
@@ -387,7 +391,7 @@ class haucs(mp_module.MPModule):
                 #load to drone
                 load_waypoints(self, mission_args['output'])
                 #load to website
-                # sorted_coords = {str(i) : [sorted_coords[i][0], sorted_coords[i][1]] for i in range(len(sorted_coords))}
+                sorted_coords = [(home[0], home[1])] + sorted_coords + [(home[0], home[1])]
                 db.reference('LH_Farm/drone/' + self.drone_id + '/mission/').set(sorted_coords)
                 print('LH_Farm/drone/' + self.drone_id + '/mission/')
                 print("uploading points", sorted_coords)

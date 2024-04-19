@@ -108,8 +108,8 @@ def estimate_missionTime(hmodule, distances, wps, args):
     - multi-speed landings
     """
     # UAV parameters
-    for i in UAV_SPEED:
-        UAV_SPEED[i] = int(hmodule.get_mav_param(i))
+    # for i in UAV_SPEED:
+    #     UAV_SPEED[i] = int(hmodule.get_mav_param(i))
     # mission parameters
     land = args['land']
     delay = args['delay']
