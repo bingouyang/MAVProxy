@@ -321,6 +321,7 @@ class haucs(mp_module.MPModule):
             data = {"lat":coord[1], "lng":coord[0],
                     "init_do":self.initial_data['DO'],
                     "init_pressure":self.initial_data['pressure'],
+                    "pid":pond_id,
                     "drone_id":self.drone_id,
                     "type":"splashdrone",
                     **self.pond_data}
