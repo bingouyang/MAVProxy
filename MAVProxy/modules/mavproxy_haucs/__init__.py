@@ -377,12 +377,12 @@ class haucs(mp_module.MPModule):
         mission_args['land'] = args[3].lower()
 
         if (int(args[4]) > mission_args['alt']) or (int(args[4]) <= 0):
-            mission_args['dive'] = 15
+            mission_args['dive'] = mission_args['alt']
         else:
             mission_args['dive'] = int(args[4])
 
-        if mission_args['alt'] < 7:
-            print(f"ALTITUDE ERROR: {mission_args['alt']}m is too low, set alt >= 7m")
+        if mission_args['alt'] < 5:
+            print(f"ALTITUDE ERROR: {mission_args['alt']}m is too low, set alt >= 5m")
         else:
             for i in mission_args:
                 print('{0: >10}: '.format(i) + str(mission_args[i]))
