@@ -12,6 +12,7 @@ from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 import math
 import threading
+import pandas as pd
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -92,8 +93,9 @@ class haucs(mp_module.MPModule):
                           "pressure":[],
                           "temp":[]}
         self.pressure_threshold = 1024
-        self.initial_data = {"DO":0,
-                             "pressure":0}
+        self.initial_data = {"DO":0, "pressure":0}
+        self.cal_count = 0
+        self.cal_target = 0
         #waypoints
         self.wploader_by_sysid = {}
         self.loading_waypoints = False
@@ -113,7 +115,7 @@ class haucs(mp_module.MPModule):
     
     def usage(self):
         '''show help on command line options'''
-        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tpayload_init\n\tgen_mission\n\tset_threshold\n\tset_id"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id"
 
 
     def cmd_haucs(self, args):
@@ -141,16 +143,28 @@ class haucs(mp_module.MPModule):
             logout(fb_app)
             print("logged out")
             self.logged_in = False
-        elif args[0] == "payload_init":
-            self.initial_data['DO'] = self.drone_variables['p_DO']
-            self.initial_data['pressure'] = self.drone_variables['p_pres']
-            print(self.initial_data)
+
+        elif args[0] == "do_init":
+            if not self.drone_variables.get('p_DO'):
+                print("initialization failed: DO sensor not connected")
+
+            else:
+                if len(args < 2):
+                    self.cal_target = 30
+                else:
+                    self.cal_target = int(args[1])
+                self.initial_data['DO'] = 0
+                self.cal_count = 0
+
+                print(f"STARTING {self.cal_target}sec DO CALIBRATION ...")
+
         elif args[0] == "set_threshold":
             if len(args) != 2:
                 print(f"set pressure threshold to trigger on-water sampling\nset to {self.pressure_threshold}")
             else:
                 self.pressure_threshold = float(args[1])
                 print(f"pressure threshold changed to {self.pressure_threshold}")
+
         elif args[0] == "set_id":
             if len(args) != 2:
                 print("set drone id\nexample: haucs set_id SPLASHY_1")
@@ -218,6 +232,7 @@ class haucs(mp_module.MPModule):
         if (time.time() - self.payload_update) > 1:
             self.payload_update = time.time()
             self.handle_pond()
+            self.handle_DO_cal(1)
 
 
     def mavlink_packet(self, m):
@@ -291,12 +306,17 @@ class haucs(mp_module.MPModule):
                 self.pond_data['temp'].append(-1)
         # initialize data
         else:
-            if self.drone_variables.get('p_DO') and self.drone_variables.get('p_pres'):
-                if (self.initial_data['pressure'] == 0):
-                    self.initial_data['DO'] = self.drone_variables['p_DO']
+            #initialize pressure
+            if self.initial_data['pressure'] == 0:
+                if self.drone_variables['p_pres'] != 0:
                     self.initial_data['pressure'] = self.drone_variables['p_pres']
                     self.pressure_threshold = self.initial_data['pressure'] + 11
-                    print("payload initialized")
+                    print("pressure initialized")
+            
+            #initialize DO
+            if (self.initial_data['DO'] == 0):
+                self.initial_data['DO'] =  self.get_init_DO()
+                print("DO initialized with stored data")
 
     def send_pond_data(self):
         #get current location
@@ -406,6 +426,31 @@ class haucs(mp_module.MPModule):
             mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, # param1: message id
             1000000, #param2: interval in microseconds
             0,0,0,0,0)
+        
+    def get_init_DO(self):
+        try:
+            df = pd.read_csv('do_calibration.csv')
+        except:
+            df = pd.DataFrame({'time':[time.time()], 'value':[1]})
+            df.to_csv('do_calibration.csv', index=False)
+
+        return float(df['value'].iloc[-1])
+    
+    def handle_DO_cal(self, t):
+        if self.cal_count < self.cal_target:
+            self.cal_count += t
+            self.initial_data['DO'] += (self.drone_variables['p_DO'] - self.initial_data['DO']) / min(self.cal_count, 60)
+
+            if (self.cal_count < self.cal_target):
+                print(f"DO calibrating {self.initial_data['DO']}mV ... {self.cal_target - self.cal_count} second(s) left")         
+            else:
+                print(f"DO Calibration FINISHED: set to {self.initial_data['DO']}mV")
+                try:
+                    df = pd.read_csv('do_calibration.csv')
+                except:
+                    df = pd.DataFrame({'time':[time.time() - 1e7], 'value':[1]})
+                df = pd.concat([df, pd.DataFrame([[time.time(), self.initial_data['DO']]], columns=df.columns)], axis=0, ignore_index=True)
+                df.to_csv('do_calibration.csv', index=False)
         
 def init(mpstate):
     '''initialise module'''
