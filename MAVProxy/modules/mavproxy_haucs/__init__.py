@@ -149,7 +149,7 @@ class haucs(mp_module.MPModule):
                 print("initialization failed: DO sensor not connected")
 
             else:
-                if len(args < 2):
+                if len(args) < 2:
                     self.cal_target = 30
                 else:
                     self.cal_target = int(args[1])
