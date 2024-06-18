@@ -438,18 +438,21 @@ class haucs(mp_module.MPModule):
     
     def handle_DO_cal(self, t):
         if self.cal_count < self.cal_target:
-            self.cal_count += t
-            self.initial_data['DO'] += (self.drone_variables['p_DO'] - self.initial_data['DO']) / min(self.cal_count, 60)
+            if self.drone_variables['p_DO'] != 0:
+                self.cal_count += t
+                self.initial_data['DO'] += (self.drone_variables['p_DO'] - self.initial_data['DO']) / min(self.cal_count, 60)
+            else:
+                print("got a 0 ... trying again")
 
             if (self.cal_count < self.cal_target):
-                print(f"DO calibrating {self.initial_data['DO']}mV ... {self.cal_target - self.cal_count} second(s) left")         
+                print(f"DO calibrating {round(self.initial_data['DO'], 2)}mV ... {round(self.cal_target - self.cal_count)} second(s) left")         
             else:
-                print(f"DO Calibration FINISHED: set to {self.initial_data['DO']}mV")
+                print(f"DO Calibration FINISHED: set to {round(self.initial_data['DO'], 2)}mV")
                 try:
                     df = pd.read_csv('do_calibration.csv')
                 except:
                     df = pd.DataFrame({'time':[time.time() - 1e7], 'value':[1]})
-                df = pd.concat([df, pd.DataFrame([[time.time(), self.initial_data['DO']]], columns=df.columns)], axis=0, ignore_index=True)
+                df = pd.concat([df, pd.DataFrame([[time.time(), round(self.initial_data['DO'], 2)]], columns=df.columns)], axis=0, ignore_index=True)
                 df.to_csv('do_calibration.csv', index=False)
         
 def init(mpstate):
