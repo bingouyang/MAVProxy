@@ -145,7 +145,7 @@ class haucs(mp_module.MPModule):
             self.logged_in = False
 
         elif args[0] == "do_init":
-            if not self.drone_variables.get('p_DO'):
+            if self.drone_variables.get('p_DO') != None:
                 print("initialization failed: DO sensor not connected")
 
             else:
