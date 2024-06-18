@@ -315,8 +315,9 @@ class haucs(mp_module.MPModule):
             
             #initialize DO
             if (self.initial_data['DO'] == 0):
-                self.initial_data['DO'] =  self.get_init_DO()
-                print("DO initialized with stored data")
+                if (self.cal_target == 0):
+                    self.initial_data['DO'] =  self.get_init_DO()
+                    print("DO initialized with stored data")
 
     def send_pond_data(self):
         #get current location
@@ -441,12 +442,14 @@ class haucs(mp_module.MPModule):
             if self.drone_variables['p_DO'] != 0:
                 self.cal_count += t
                 self.initial_data['DO'] += (self.drone_variables['p_DO'] - self.initial_data['DO']) / min(self.cal_count, 60)
+                avg_data = round(self.initial_data['DO'], 2)
+                new_data = round(self.drone_variables['p_DO'], 2)
+                time_left = round(self.cal_target - self.cal_count)
+                print(f"DO CALIBRATING ... sensor val {new data}mV ... average val {avg_data}mV ... {time_left} second(s) left")  
             else:
                 print("got a 0 ... trying again")
-
-            if (self.cal_count < self.cal_target):
-                print(f"DO calibrating {round(self.initial_data['DO'], 2)}mV ... {round(self.cal_target - self.cal_count)} second(s) left")         
-            else:
+      
+            if (self.cal_count >= self.cal_target):
                 print(f"DO Calibration FINISHED: set to {round(self.initial_data['DO'], 2)}mV")
                 try:
                     df = pd.read_csv('do_calibration.csv')
