@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 from MAVProxy.modules.lib import mp_module, mp_util, mp_settings
 from MAVProxy.modules.mavproxy_haucs import path_planner
+from MAVProxy.modules.mavproxy_haucs import lidar_logger
 from MAVProxy.modules.mavproxy_haucs.waypoint_helper import *
 from pymavlink import mavutil, mavwp
 import firebase_admin
@@ -129,6 +130,8 @@ class haucs(mp_module.MPModule):
         elif args[0] == "sub":
             print("subscribing ...")
             self.extended_sys_subscribe()
+            lidar_logger.init()
+            lidar_logger.subscribe(self)
         elif args[0] == "login":
             with open('fb_key.json', 'r') as file:
                 fb_key = file.read()
@@ -247,6 +250,8 @@ class haucs(mp_module.MPModule):
             self.drone_variables['alt'] = m.alt/1000
             self.drone_variables['hdg'] = m.hdg/100
             self.drone_variables['vel'] = round(math.sqrt(m.vx**2 + m.vy**2 + m.vz**2)/100, 2)
+            lidar_logger.write([m.time_boot_ms, m.get_type(), m.lat, m.lon, m.alt, m.hdg, m.vx, m.vy, m.vz])
+
         elif m.get_type() == 'BATTERY_STATUS':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['voltage'] = m.voltages[0]/1000
@@ -270,10 +275,12 @@ class haucs(mp_module.MPModule):
                 print("REBOOT DETECTED")
                 self.drone_variables['battery_time'] = 0
             self.time_boot_ms = m.time_boot_ms
-
         elif m.get_type() in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
             process_waypoint_request(self, m, self.master)
-
+        elif m.get_type() == 'DISTANCE_SENSOR':
+            lidar_logger.write([m.time_boot_ms, m.get_type(), m.current_distance, 0, 0, 0, 0, 0, 0])
+        elif m.get_type() == 'ATTITUDE':
+            lidar_logger.write([m.time_boot_ms, m.get_type(), m.roll, m.pitch, m.yaw, m.rollspeed, m.pitchspeed, m.yawspeed, 0])
     def handle_pond(self):        
         #get pressure
         pressure = self.drone_variables['p_pres']
@@ -427,7 +434,7 @@ class haucs(mp_module.MPModule):
             mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, # param1: message id
             1000000, #param2: interval in microseconds
             0,0,0,0,0)
-        
+    
     def get_init_DO(self):
         try:
             df = pd.read_csv('do_calibration.csv')
@@ -457,7 +464,17 @@ class haucs(mp_module.MPModule):
                     df = pd.DataFrame({'time':[time.time() - 1e7], 'value':[1]})
                 df = pd.concat([df, pd.DataFrame([[time.time(), round(self.initial_data['DO'], 2)]], columns=df.columns)], axis=0, ignore_index=True)
                 df.to_csv('do_calibration.csv', index=False)
-        
+
+    def rng_subscribe(self):
+        self.master.mav.command_long_send(
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, # command
+            0, # confirmation
+            mavutil.mavlink.MAVLINK_MSG_ID_DISTANCE_SENSOR, # param1: message id
+            100000, #param2: interval in microseconds (1 second)
+            0,0,0,0,0)
+
 def init(mpstate):
     '''initialise module'''
     return haucs(mpstate)

@@ -17,3 +17,6 @@ windows/version.txt
 /.vscode
 *.parm
 fb_key.json
+lidar_data
+.csv
+.txt
