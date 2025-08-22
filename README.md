@@ -1,28 +1,33 @@
-![GitHub Actions](https://github.com/ardupilot/MAVProxy/actions/workflows/windows_build.yml/badge.svg)
+# Forked Version of MavProxy
 
-MAVProxy
+## HAUCS CODE
 
-This is a MAVLink ground station written in python. 
+All mavproxy development occurs in the haucs module located in `MAVProxy/modules/mavproxy_haucs`.
 
-Please see https://ardupilot.org/mavproxy/index.html for more information
+## Initial Setup
 
-This ground station was developed as part of the CanberraUAV OBC team
-entry
+Run the following commands to create a virtual environment
+```
+python3 -m venv mavproxy --system-site-packages
+```
 
-License
--------
+Make sure to initialize the virtual environment whenever running or developing the code
 
-MAVProxy is released under the GNU General Public License v3 or later
+```
+source mavpproxy/bin/activate
+```
 
+### MAVProxy Development Guide
 
-Maintainers
------------
+Follow all of the MAVProxy instructions for setting up your development environment:
 
-The best way to discuss MAVProxy with the maintainers is to join the
-mavproxy channel on ArduPilot discord at https://ardupilot.org/discord
+https://ardupilot.org/mavproxy/docs/development/index.html
 
-Lead Developers: Andrew Tridgell and Peter Barker
+### Additional Steps
 
-Windows Maintainer: Stephen Dade
+Install all of the necessary python libraries for HAUCS
 
-MacOS Maintainer: Rhys Mainwaring
+```
+pip3 install -r requirements.txt
+```
+
