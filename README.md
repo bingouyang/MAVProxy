@@ -35,3 +35,9 @@ pip3 install -r requirements.txt
 ```
 
 Copy `fb_key.json` into the main folder (don't push this to github)
+
+## How To Run
+To run mavproxy, run the following .bat script:
+```
+MAVProxyWinUSB.bat
+```
