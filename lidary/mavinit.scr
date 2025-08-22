@@ -1,0 +1,10 @@
+set shownoise false
+set streamrate -1
+set streamrate2 -1
+module load messagerate
+messagerate set GLOBAL_POSITION_INT 20
+messagerate set ATTITUDE 20
+messagerate set DISTANCE_SENSOR 20
+messagerate set BATTERY_STATUS 2
+module load haucs
+haucs login

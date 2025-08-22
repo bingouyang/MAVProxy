@@ -8,13 +8,16 @@ All mavproxy development occurs in the haucs module located in `MAVProxy/modules
 
 Run the following commands to create a virtual environment
 ```
-python3 -m venv mavproxy --system-site-packages
+python3 -m venv gcs --system-site-packages
 ```
 
 Make sure to initialize the virtual environment whenever running or developing the code
 
-```
-source mavpproxy/bin/activate
+```bash
+# linux
+source gcs/bin/activate
+# windows
+.\gcs\Scripts\activate
 ```
 
 ### MAVProxy Development Guide
@@ -31,3 +34,4 @@ Install all of the necessary python libraries for HAUCS
 pip3 install -r requirements.txt
 ```
 
+Copy `fb_key.json` into the main folder (don't push this to github)
