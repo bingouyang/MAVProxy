@@ -3,6 +3,8 @@ from MAVProxy.modules.lib import mp_module, mp_util, mp_settings
 from MAVProxy.modules.mavproxy_haucs import path_planner
 from MAVProxy.modules.mavproxy_haucs import lidar_logger
 from MAVProxy.modules.mavproxy_haucs.waypoint_helper import *
+from MAVProxy.modules.mavproxy_haucs.sampling_helper import *
+
 from pymavlink import mavutil, mavwp
 import firebase_admin
 from firebase_admin import db, credentials, exceptions
@@ -29,6 +31,37 @@ LANDED_STATE = {0:'unknown',
 
 FLIGHT_MODE = {0:'Stabilize', 1:'Acro', 2:'AltHold', 3:'Auto', 4:'Guided', 5:'Loiter', 6:'RTL', 7:'Circle',
                9:'Land', 11:'Drift', 13:'Sport', 14:'Flip', 15:'AutoTune', 16:'PosHold', 17:'Brake'}
+
+
+
+################### Logic to handle sampling ####################
+# define KEYWORDS
+NAV_TAKEOFF   = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+NAV_WP        = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+NAV_LAND      = mavutil.mavlink.MAV_CMD_NAV_LAND
+
+NAV_IN_AIR    = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
+NAV_ON_GROUND = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+
+# landing/taking off status initialization
+st = {
+  'last': None, 'seen_init': False,
+  'touch_t0': None, 'touch_confirmed': False,
+  'final_pending': False
+}
+
+################# param for comm with PI ################################
+PC_SYSID = 255
+PC_COMP = 1
+PI_SYSID = 200
+PORT = 5770
+################  PARMS for DATA64/96 decoding   ########################
+SCALE = 64
+FLAG_NONE = 0
+FLAG_SOF  = 1
+FLAG_EOF  = 2
+FLAG_SOLO = 3
+########################################################################
 
 ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1',
              '003F003F 30325115 33383839':'SPLASHY_2'}
@@ -72,7 +105,7 @@ class haucs(mp_module.MPModule):
     def __init__(self, mpstate):
         """Initialise module"""
         super(haucs, self).__init__(mpstate, "haucs", "")
-        self.drone_id = "UNKNOWN"
+        self.drone_id = "UNKNOWN"        
         self.logged_in = False
         self.firebase_update = time.time()
         self.firebase_thread = False
@@ -101,10 +134,17 @@ class haucs(mp_module.MPModule):
         self.wploader_by_sysid = {}
         self.loading_waypoints = False
         self.loading_waypoint_lasttime = time.time()
-
+        
         self.haucs_settings = mp_settings.MPSettings(
             [ ('verbose', bool, False),])
         self.add_command('haucs', self.cmd_haucs, "haucs module", ['status','set (LOGSETTING)'])
+
+        ################################
+        # initialize take/off land status
+        self.state = {'last': None, 'seen_init': False}
+        
+        self.sampling_lat = 0.0
+        self.sampling_lon = 0.0
 
     @property
     def wploader(self):
@@ -117,7 +157,6 @@ class haucs(mp_module.MPModule):
     def usage(self):
         '''show help on command line options'''
         return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id"
-
 
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
@@ -133,7 +172,7 @@ class haucs(mp_module.MPModule):
             lidar_logger.init()
             lidar_logger.subscribe(self)
         elif args[0] == "login":
-            with open('fb_key.json', 'r') as file:
+            with open('../fb_key.json', 'r') as file:
                 fb_key = file.read()
             try:
                 global fb_app
@@ -228,8 +267,6 @@ class haucs(mp_module.MPModule):
                     self.firebase_thread = True
                     db_thread = threading.Thread(target=self.idle_firebase_update, args=(self.drone_variables.copy(),))
                     db_thread.start()
-
-
         
         # update pond data
         if (time.time() - self.payload_update) > 1:
@@ -237,12 +274,12 @@ class haucs(mp_module.MPModule):
             self.handle_pond()
             self.handle_DO_cal(1)
 
-
     def mavlink_packet(self, m):
         '''handle mavlink packets'''
         if m.get_type() == 'NAMED_VALUE_FLOAT':
             self.timers[m.get_type()] = time.time()
             self.drone_variables[m.name] = round(m.value,2)
+            
         elif m.get_type() == 'GLOBAL_POSITION_INT':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['lat'] = m.lat/1e7
@@ -251,7 +288,7 @@ class haucs(mp_module.MPModule):
             self.drone_variables['hdg'] = m.hdg/100
             self.drone_variables['vel'] = round(math.sqrt(m.vx**2 + m.vy**2 + m.vz**2)/100, 2)
             lidar_logger.write([m.time_boot_ms, m.get_type(), m.lat, m.lon, m.alt, m.hdg, m.vx, m.vy, m.vz])
-
+            
         elif m.get_type() == 'BATTERY_STATUS':
             self.timers[m.get_type()] = time.time()
             self.drone_variables['voltage'] = m.voltages[0]/1000
@@ -259,8 +296,10 @@ class haucs(mp_module.MPModule):
             self.drone_variables['mah_consumed'] = m.current_consumed
             self.drone_variables['battery_remaining'] = m.battery_remaining
             self.drone_variables['time_remaining'] = m.time_remaining
+            
         elif m.get_type() == 'HEARTBEAT':
             self.handle_heartbeat(m)
+            
         elif m.get_type() == 'STATUSTEXT':
             self.drone_variables['msg_severity'] = m.severity
             self.drone_variables['msg'] = m.text
@@ -270,65 +309,55 @@ class haucs(mp_module.MPModule):
                 drone_id = " ".join(msg[1:])
                 if ID_LOOKUP.get(drone_id):
                     self.drone_id = ID_LOOKUP[drone_id]
+            
+            ### determine final landing is next ##################
+            detect_mission_complete(m.text, st)
+            
         elif m.get_type() == 'SYSTEM_TIME':
             if m.time_boot_ms < self.time_boot_ms:
                 print("REBOOT DETECTED")
                 self.drone_variables['battery_time'] = 0
             self.time_boot_ms = m.time_boot_ms
+            
         elif m.get_type() in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
             process_waypoint_request(self, m, self.master)
+            
         elif m.get_type() == 'DISTANCE_SENSOR':
             lidar_logger.write([m.time_boot_ms, m.get_type(), m.current_distance, 0, 0, 0, 0, 0, 0])
+            
         elif m.get_type() == 'ATTITUDE':
             lidar_logger.write([m.time_boot_ms, m.get_type(), m.roll, m.pitch, m.yaw, m.rollspeed, m.pitchspeed, m.yawspeed, 0])
-    def handle_pond(self):        
-        #get pressure
-        pressure = self.drone_variables['p_pres']
-        #set water state
-        prev_on_water = self.drone_variables['on_water']
-        if pressure >self.pressure_threshold:
-            self.drone_variables['on_water'] = True
-        else:
-            self.drone_variables['on_water'] = False
-        on_water = self.drone_variables['on_water']
-
-        #state machine for handling pond data
-        # if taking off, send data, clear data
-        if prev_on_water and not on_water:
-            self.send_pond_data()
-            self.pond_data['pressure'] = []
-            self.pond_data['do'] = []
-            self.pond_data['temp'] = []
-        # if sitting on pond, record data
-        elif on_water:
-            last_update = time.time() - self.timers['NAMED_VALUE_FLOAT']
-            # if payload data is fresh
-            if last_update < 5:
-                self.pond_data['pressure'].append(self.drone_variables['p_pres'])
-                self.pond_data['do'].append(self.drone_variables['p_DO'])
-                self.pond_data['temp'].append(self.drone_variables['p_temp'])
-            else:
-                self.pond_data['pressure'].append(-1)
-                self.pond_data['do'].append(-1)
-                self.pond_data['temp'].append(-1)
-        # initialize data
-        else:
-            #initialize pressure
-            if self.initial_data['pressure'] == 0:
-                if self.drone_variables['p_pres'] != 0:
-                    self.initial_data['pressure'] = self.drone_variables['p_pres']
-                    self.pressure_threshold = self.initial_data['pressure'] + 11
-                    print("pressure initialized")
             
-            #initialize DO
-            if (self.initial_data['DO'] == 0):
-                if (self.cal_target == 0):
-                    self.initial_data['DO'] =  self.get_init_DO()
-                    print("DO initialized with stored data")
-
+        # handles data packets
+        elif msg.get_type() == "DATA64":
+            payload = bytes(msg.data)[:msg.len]
+            seq_id, is_resend, var_id, var_len, values, flags = parse_inner(payload)
+            print(f"PC got var {var_id} seq {seq_id} resend {is_resend} len {var_len} flags {flags}")
+            if flags == FLAG_SOF:
+                print("PC start of frame")
+            elif flags == FLAG_EOF:
+                print("PC end of frame")
+            elif flags == FLAG_SOLO:
+                print("PC single-packet frame")
+        
+        # use the EXTENDED_SYS_STATE to trigger sampling state machine
+        elif m.get_type() == "EXTENDED_SYS_STATE":
+            evt = handle_extsys_with_final(m.landed_state, st)
+            if evt == "INIT_TAKEOFF":
+                gcs_broadcast(self, "[GCS] INIT_TAKEOFF")
+            elif evt == "TAKEOFF":
+                gcs_broadcast(self, "[GCS] TAKEOFF")
+            elif evt == "TOUCHDOWN_INTERMEDIATE":
+                gcs_broadcast(self, "[GCS] Touchdown (sampling)")
+                self.sampling_lat, self.sampling_lon = self.drone_variables['lat'], self.drone_variables['lon']
+                print("Locked GPS:", self.sampling_lat, self.sampling_lon)
+            elif evt == "TOUCHDOWN_FINAL":
+                gcs_broadcast(self, "[GCS] Touchdown (FINAL)")
+                
     def send_pond_data(self):
         #get current location
-        coord = [self.drone_variables['lon'], self.drone_variables['lat']]
+        #coord = [self.drone_variables['lon'], self.drone_variables['lat']]
+        coord = [self.sampling_lat, self.sampling_lon]
         location = Point(coord)
         #get last do measurement
         last_do = self.pond_data['do'][-1] / self.initial_data['DO'] * 100
@@ -478,3 +507,4 @@ class haucs(mp_module.MPModule):
 def init(mpstate):
     '''initialise module'''
     return haucs(mpstate)
+
