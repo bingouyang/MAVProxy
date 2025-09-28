@@ -3,7 +3,6 @@ from MAVProxy.modules.lib import mp_module, mp_util, mp_settings
 from MAVProxy.modules.mavproxy_haucs import path_planner
 from MAVProxy.modules.mavproxy_haucs import lidar_logger
 from MAVProxy.modules.mavproxy_haucs.waypoint_helper import *
-from MAVProxy.modules.mavproxy_haucs.sampling_helper import *
 
 from pymavlink import mavutil, mavwp
 import firebase_admin
@@ -32,7 +31,25 @@ LANDED_STATE = {0:'unknown',
 FLIGHT_MODE = {0:'Stabilize', 1:'Acro', 2:'AltHold', 3:'Auto', 4:'Guided', 5:'Loiter', 6:'RTL', 7:'Circle',
                9:'Land', 11:'Drift', 13:'Sport', 14:'Flip', 15:'AutoTune', 16:'PosHold', 17:'Brake'}
 
+sensor_data_names = {
+    0: "time"
+    1: "DO",
+    2: "temp",
+    3: "pressure",
+    4: "init_DO",
+    5: "init_pressure",
+    6: "batt_v",
+}
 
+sensor_data_values = {
+    "time: []
+    "DO": [],
+    "temp": [],
+    "pressure": [],
+    "init_DO":[],
+    "init_pressure:[],
+    "batt_va":[],
+}
 
 ################### Logic to handle sampling ####################
 # define KEYWORDS
@@ -50,6 +67,7 @@ st = {
   'final_pending': False
 }
 
+SENSORDIR ='C:\SENSOR_DATA_ARCHIVE\'
 ################# param for comm with PI ################################
 PC_SYSID = 255
 PC_COMP = 1
@@ -70,7 +88,6 @@ ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1',
 def login(key_dict):
     """
     Start a Firebase Instance
-
     return: an app instance
     """
     data = json.loads(key_dict)
@@ -100,6 +117,78 @@ def get_pond_table():
         ponds[id] = Polygon(coords)
     
     return ponds
+
+'''
+#WIP!!! def reupload_data in the archieve
+def parse_all_sensor_data(root_path=sensor_root_dir):
+    field_map = load_field_mapping(FIELDS_CSV)
+    any_new_data = False
+
+    for entry in os.listdir(root_path):
+        if not re.match(r"^\d", entry):  # Skip if folder name doesn't start with a digit
+            continue
+            
+        if entry in excluded_sensors:
+            print(f"Skipping excluded sensor: {entry}")
+            continue
+
+        sensor_path = os.path.join(root_path, entry)
+        data_file = os.path.join(sensor_path, "data.txt")
+        print(data_file)
+        
+        if os.path.isdir(sensor_path) and os.path.exists(data_file):
+            print(f"\nChecking {entry}...")
+            last_ts = load_last_processed(entry)
+            #print(f"Loaded last_ts for {entry}: {last_ts}")
+            new_data = load_new_data(sensor_path, field_map, last_ts)
+
+            if not new_data.empty:
+                print(f"New data found for {entry}:")
+                detect_and_update_pond_id(entry, new_data)
+                latest_ts = new_data["timestamp"].max().strftime("%Y%m%d_%H:%M:%S")
+                success = enrich_and_upload_with_pressure(entry, new_data)     
+                #success = True # testing
+                if success == "success":
+                    save_last_processed(entry, latest_ts)
+                    archive_uploaded_data(entry, new_data, latest_ts)
+                    any_new_data = True
+                elif success == "upload_failed":
+                    print(f"Upload failed for {entry}. Will retry next time.")
+                elif success == "no_valid_data":
+                    print(f"No valid data (e.g., missing pressure) for {entry}.")
+                elif success == "no_data":
+                    print(f"No new data found for {entry}.")
+                else:
+                    print(f"Unexpected status '{status}' for {entry}")            
+                   
+    if not any_new_data:
+        print("No new data found in any sensor directory.")
+'''
+
+def save_json(sdata,sensor_file):
+    with open(sensor_file, 'w') as outfile:
+        json.dump(sdata, outfile)
+
+def append_json(key,value,sensor_file):
+    with open(sensor_file, 'r') as file:
+        data = json.load(file)
+    data[key] = value
+    with open(sensor_file, 'w') as file:
+        json.dump(data, file, indent=4)
+
+# -------------------- Msg Decoder --------------------
+def msg_decoder(buf):
+    seq_id = struct.unpack_from("!I", buf, 0)[0]
+    var_byte = buf[4]
+    var_base = struct.unpack_from("!h", buf, 5)[0]
+    varlen_raw = buf[7]
+    flags = (varlen_raw >> 6) & 0x3
+    var_len = varlen_raw & 0x3F
+    residues = list(struct.unpack_from("!" + "b"*var_len, buf, 8))
+    is_resend = 1 if (var_byte & 0x80) else 0
+    var_id = var_byte & 0x7F
+    values = [var_base + r / SCALE for r in residues]
+    return seq_id, is_resend, var_id, var_len, values, flags
 
 class haucs(mp_module.MPModule):
     def __init__(self, mpstate):
@@ -173,10 +262,9 @@ class haucs(mp_module.MPModule):
             lidar_logger.subscribe(self)
         elif args[0] == "login":
             with open('../fb_key.json', 'r') as file:
-                fb_key = file.read()
+                self.fb_key = file.read()
             try:
-                global fb_app
-                fb_app = login(fb_key)
+                self.fb_app = login(fb_key)
                 self.logged_in = True
                 print("logged in to firebase")
             except:
@@ -199,14 +287,7 @@ class haucs(mp_module.MPModule):
                 self.cal_count = 0
 
                 print(f"STARTING {self.cal_target}sec DO CALIBRATION ...")
-
-        elif args[0] == "set_threshold":
-            if len(args) != 2:
-                print(f"set pressure threshold to trigger on-water sampling\nset to {self.pressure_threshold}")
-            else:
-                self.pressure_threshold = float(args[1])
-                print(f"pressure threshold changed to {self.pressure_threshold}")
-
+                
         elif args[0] == "set_id":
             if len(args) != 2:
                 print("set drone id\nexample: haucs set_id SPLASHY_1")
@@ -219,11 +300,9 @@ class haucs(mp_module.MPModule):
             else:
                 if not self.drone_variables.get('lat'):
                     print("!!!TEST MODE!!!: no data from gps (check power, gps status, GCS messages)")
-                    # test_home = (27.535321985800824, -80.35167917904866, 0) # lab
+                    test_home = (27.535321985800824, -80.35167917904866, 0) # lab
                     # test_home = (37.706386197905516, -89.45029871125445, 0) # logan hollow
-                    test_home = (37.70852528763561,  -89.45354741670316, 0)
-                   
-          
+                    # test_home = (37.70852528763561,  -89.45354741670316, 0)
                     self.gen_mission(test_home, 'true', args[1:])
                 else:
                     home = (self.drone_variables['lat'], self.drone_variables['lon'], self.drone_variables['alt'])
@@ -275,6 +354,8 @@ class haucs(mp_module.MPModule):
             self.handle_DO_cal(1)
 
     def mavlink_packet(self, m):
+        global fb_key
+        global fb_app
         '''handle mavlink packets'''
         if m.get_type() == 'NAMED_VALUE_FLOAT':
             self.timers[m.get_type()] = time.time()
@@ -328,18 +409,6 @@ class haucs(mp_module.MPModule):
         elif m.get_type() == 'ATTITUDE':
             lidar_logger.write([m.time_boot_ms, m.get_type(), m.roll, m.pitch, m.yaw, m.rollspeed, m.pitchspeed, m.yawspeed, 0])
             
-        # handles data packets
-        elif msg.get_type() == "DATA64":
-            payload = bytes(msg.data)[:msg.len]
-            seq_id, is_resend, var_id, var_len, values, flags = parse_inner(payload)
-            print(f"PC got var {var_id} seq {seq_id} resend {is_resend} len {var_len} flags {flags}")
-            if flags == FLAG_SOF:
-                print("PC start of frame")
-            elif flags == FLAG_EOF:
-                print("PC end of frame")
-            elif flags == FLAG_SOLO:
-                print("PC single-packet frame")
-        
         # use the EXTENDED_SYS_STATE to trigger sampling state machine
         elif m.get_type() == "EXTENDED_SYS_STATE":
             evt = handle_extsys_with_final(m.landed_state, st)
@@ -353,47 +422,54 @@ class haucs(mp_module.MPModule):
                 print("Locked GPS:", self.sampling_lat, self.sampling_lon)
             elif evt == "TOUCHDOWN_FINAL":
                 gcs_broadcast(self, "[GCS] Touchdown (FINAL)")
-                
-    def send_pond_data(self):
-        #get current location
-        #coord = [self.drone_variables['lon'], self.drone_variables['lat']]
-        coord = [self.sampling_lat, self.sampling_lon]
-        location = Point(coord)
-        #get last do measurement
-        last_do = self.pond_data['do'][-1] / self.initial_data['DO'] * 100
-        #get current pond
-        pond_id = "unknown"
-        for i in self.pond_table:
-            if self.pond_table[i].contains(location):
-                pond_id = str(i)
-                break
-
-        print("sampled at: ", pond_id)
-        print("   last do: ", last_do)
-        print(self.pond_data)
-
-        #upload data to firebase
-        if self.logged_in:
+        
+        # handles data packets
+        elif msg.get_type() == "DATA96":
+            self.proc_sensordata(self,msg)
+              
+    def proc_sensordata(self,msg)
+        payload = bytes(msg.data)[:msg.len]      
+        seq_id, is_resend, var_id, var_len, values, flags = msg_decoder(payload)
+        name = sensor_data_names.get(var_id)
+        sensor_data_values[name].extend(values)    
+        print(f"PC got var {var_id} seq {seq_id} resend {is_resend} len {var_len} flags {flags}")
+        if flags == FLAG_SOF:
+            print("PC start of frame")
+        elif flags == FLAG_EOF or flags == FLAG_SOLO:
+            print("PC end of frame")
             message_time = time.strftime('%Y%m%d_%H:%M:%S', time.gmtime(time.time()))
-            data = {"lat":coord[1], "lng":coord[0],
-                    "init_do":self.initial_data['DO'],
-                    "init_pressure":self.initial_data['pressure'],
-                    "pid":pond_id,
-                    "drone_id":self.drone_id,
-                    "type":"splashdrone",
-                    **self.pond_data}
-            
-            try:
+            sensor_file= os.path.join(SENSORDIR, message_time, '.json')
+            #send_pond_data
+            try:                
+                drone_id =self.drone_id #hard code it for now
+                do_array = sensor_data_values['DO']
+                temp_array = sensor_data_values['temp']
+                pres_array = sensor_data_values['pressure']
+                ####################################################################
+                # being lazy... pading init_DO, init_pressure, batt_v to same length as data,
+                # here just grab one value.
+                init_DO_array = sensor_data_values['init_DO']
+                init_DO=init_DO_array[0]
+                init_pressure_array = sensor_data_values['init_pressure']
+                init_pressure=init_pressure_array[0]
+                batt_v_array = sensor_data_values['batt_v']
+                batt_v = batt_v_array[0]
+                
+                data = {'do': do_array, 'init_do': init_DO, 'init_pressure': init_pressure,
+                        'lat': lat, 'lng': lng, 'pid': pond_id, 'pressure': pres_array, 'sid': drone_id,
+                        'temp': temp_array,
+                        'batt_v': batt_v, 'type': 'winch'}
+                
+                save_json(data,sensor_file) # save the data
+                # clear the current back of sensor data
+                sensor_data_values.clear()
                 db.reference('LH_Farm/pond_' + pond_id + '/' + message_time + '/').set(data)
-                db.reference("LH_Farm/overview/pond_" + pond_id + '/last_do/').set(last_do)
-
-                #update recent
-                recent_data = db.reference('/LH_Farm/recent').order_by_key().limit_to_last(9).get()
-                recent_data[message_time] = data
-                db.reference('/LH_Farm/recent').set(recent_data)
-                print("uploaded data")
+                append_json('upload',1,sensor_file) # update the upload status
             except:
-                print("UPLOAD FAILED: likely no internet connection")
+                logger.warning("uploading data to firebase failed")
+                restart_firebase(fb_app, fb_key)
+                print("uploading data to firebase failed")
+                append_json('upload',0,sensor_file) # update the upload status - to prepare for retry
     
     def handle_heartbeat(self, m):
         #flight mode

@@ -79,6 +79,8 @@ def handle_extsys_with_final(landed_state, st):
     st['last'] = landed_state
     return evt
 
+SEND_ORDER = ["time","do", "temp", "press"] 
+VAR_MAP = {"time": 0, "do": 1, "temp": 2, "press": 3}
 # -------------------- Msg Decoder --------------------
 def parse_inner(buf):
     seq_id = struct.unpack_from("!I", buf, 0)[0]
