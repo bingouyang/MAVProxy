@@ -388,6 +388,7 @@ class haucs(mp_module.MPModule):
 
     def mavlink_packet(self, m):
         '''handle mavlink packets'''
+        print(f"msg type: {m.get_type()}")
         if m.get_type() == 'NAMED_VALUE_FLOAT':
             self.timers[m.get_type()] = time.time()
             self.drone_variables[m.name] = round(m.value,2)
