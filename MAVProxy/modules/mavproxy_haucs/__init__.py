@@ -51,6 +51,16 @@ sensor_data_values = {
     "init_pressure":[],
     "batt_v":[],
 }
+# payload and header for encoding
+DATA_BYTES = 96
+HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
+MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
+SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
+# set or read the two high bits in var_len (payload[7])
+FLAG_NONE = 0
+FLAG_EOF  = 1  # end of frame
+FLAG_SOF  = 2  # optional start
+FLAG_SOLO = 3  # optional solo
 
 ################### Logic to handle sampling ####################
 # define KEYWORDS
@@ -74,16 +84,32 @@ PC_SYSID = 255
 PC_COMP = 1
 PI_SYSID = 200
 PORT = 5770
-################  PARMS for DATA64/96 decoding   ########################
-SCALE = 64
-FLAG_NONE = 0
-FLAG_SOF  = 1
-FLAG_EOF  = 2
-FLAG_SOLO = 3
 ########################################################################
 
 ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1',
              '003F003F 30325115 33383839':'SPLASHY_2'}
+
+def _print_latest(self):
+    do   = sensor_data_values.get('DO', [])
+    tmp  = sensor_data_values.get('temp', [])
+    pres = sensor_data_values.get('pressure', [])
+    batt = sensor_data_values.get('batt_v', [])
+    t    = sensor_data_values.get('time', [])
+
+    do_v   = do[-1]   if do   else None
+    tmp_v  = tmp[-1]  if tmp  else None
+    pres_v = pres[-1] if pres else None
+    batt_v = batt[-1] if batt else None
+    t_v    = t[-1]    if t    else None
+
+    # Write to MAVProxy console (not just stdout)
+    self.console.writeln(
+        f"[HAUCS] t={t_v if t_v is not None else '--'} "
+        f"DO={do_v if do_v is not None else '--'} "
+        f"T={tmp_v if tmp_v is not None else '--'} "
+        f"P={pres_v if pres_v is not None else '--'} "
+        f"Batt={batt_v if batt_v is not None else '--'}"
+    )
 
 #### FIREBASE FUNCTIONS ####
 def login(key_dict):
@@ -434,7 +460,8 @@ class haucs(mp_module.MPModule):
         # handles data packets
         elif m.get_type() == "DATA96":
             self.proc_sensordata(m)
-              
+            self._print_latest()  
+
     def proc_sensordata(self, m):
         payload = bytes(m.data)[:m.len]      
         seq_id, is_resend, var_id, var_len, values, flags = msg_decoder(payload)
