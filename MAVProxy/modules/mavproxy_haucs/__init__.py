@@ -124,6 +124,7 @@ def get_pond_table():
     return ponds
 
 
+
 def save_json(sdata,sensor_file):
     with open(sensor_file, 'w') as outfile:
         json.dump(sdata, outfile)
@@ -173,12 +174,14 @@ class haucs(mp_module.MPModule):
                                 "mission_time":0,
                                 "arm_state":"disarmed",
                                 "current":0,
+                                "pond_id":"pond_ukn",
                                 }
         self.on_water = False
         self.pond_table = get_pond_table()
         self.pond_data = {"do":[],
                           "pressure":[],
-                          "temp":[]}
+                          "temp":[],
+                          "pond_id":"pond_ukn"}
         self.pressure_threshold = 1024
         self.initial_data = {"DO":0, "pressure":0}
         self.cal_count = 0
@@ -213,6 +216,19 @@ class haucs(mp_module.MPModule):
             self.wploader_by_sysid[self.target_system].expected_count = 0
         return self.wploader_by_sysid[self.target_system]
     
+    def get_pond_id(self):
+        #get current location
+        coord = [self.sampling_lng, self.sampling_lat]
+        location = Point(coord)
+        #get last do measurement
+        #get current pond
+        pond_id = "unknown"
+        for i in self.pond_table:
+            if self.pond_table[i].contains(location):
+                pond_id = str(i)
+                break
+        return pond_id
+
     def usage(self):
         '''show help on command line options'''
         return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id"
@@ -418,8 +434,8 @@ class haucs(mp_module.MPModule):
                     # locking GPS and pond id
                     self.sampling_lat = self.drone_variables['lat']
                     self.sampling_lng = self.drone_variables['lon']
-                    self.pond_id=get_pond_id(self.sampling_lat, self.sampling_lng)
-                    self.console.writeln(f"Locked GPS: {self.sampling_lat}, {self.sampling_lng}")
+                    self.pond_data['pond_id']=self.get_pond_id()
+                    self.console.writeln(f"Locked GPS: {self.sampling_lat}, {self.sampling_lng} for pond: {self.pond_data['pond_id']}")
                 elif evt == "TOUCHDOWN_FINAL":
                     self.console.writeln("Touchdown (FINAL)")
             
@@ -437,8 +453,10 @@ class haucs(mp_module.MPModule):
                 #    )
                 self.proc_sensordata(m)
         except Exception as e:
+                err = traceback.format_exc(limit=1)  # 1 = just the last frame
+                self.console.writeln(f"[haucs] handler error: {err.strip()}")
                 # never let one bad packet kill the whole dispatcher
-                self.console.writeln(f"[haucs] mavlink handler error: {type(e).__name__}: {e}")
+                #self.console.writeln(f"[haucs] mavlink handler error: {type(e).__name__}: {e}")
         
     def proc_sensordata(self, m):
         payload = bytes(m.data)[:m.len]      
@@ -454,13 +472,13 @@ class haucs(mp_module.MPModule):
             print("PC start of frame")
         elif flags == FLAG_EOF or flags == FLAG_SOLO:
             print("PC end of frame")
-            message_time = time.strftime('%Y%m%d_%H:%M:%S', time.gmtime(time.time()))
+            message_time = time.strftime('%Y%m%d_%H%M%S', time.gmtime(time.time()))
             os.makedirs(SENSORDIR, exist_ok=True)
             sensor_file= os.path.join(SENSORDIR, f'{message_time}.json')
             #send_pond_data
             try:                
                 drone_id =self.drone_id #hard code it for now
-                pond_id  =self.pond_id
+                pond_id  =self.pond_data['pond_id']
                 do_array = sensor_data_values['DO']
                 temp_array = sensor_data_values['temp']
                 pres_array = sensor_data_values['pressure']
@@ -490,6 +508,8 @@ class haucs(mp_module.MPModule):
                 append_json('upload',1,sensor_file) # update the upload status
             except Exception as e:
                 #logger.warning("uploading data to firebase failed")
+                err = traceback.format_exc(limit=1)  # 1 = just the last frame
+                self.console.writeln(f"[haucs] file error: {err.strip()}")
                 self.fb_app = restart_firebase(self.fb_app, self.fb_key)
                 self.console.writeln(f"uploading data to firebase failed: {e}")
                 append_json('upload',0,sensor_file) # update the upload status - to prepare for retry
