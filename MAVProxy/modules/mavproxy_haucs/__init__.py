@@ -23,6 +23,8 @@ import traceback, time
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy --out 172.20.10.5:14550
 # mavproxy.py --master=udp:127.0.0.1:14550 --aircraft=splashy
 
+
+
 LANDED_STATE = {0:'unknown',
                 1:'landed',
                 2:'in air',
