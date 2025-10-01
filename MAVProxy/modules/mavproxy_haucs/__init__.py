@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 from MAVProxy.modules.lib import mp_module, mp_util, mp_settings
 from MAVProxy.modules.mavproxy_haucs import path_planner
 from MAVProxy.modules.mavproxy_haucs import lidar_logger
@@ -16,6 +15,7 @@ import math
 import threading
 import pandas as pd
 import struct
+import traceback, time
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -89,28 +89,6 @@ PORT = 5770
 ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1',
              '003F003F 30325115 33383839':'SPLASHY_2'}
 
-def _print_latest(self):
-    do   = sensor_data_values.get('DO', [])
-    tmp  = sensor_data_values.get('temp', [])
-    pres = sensor_data_values.get('pressure', [])
-    batt = sensor_data_values.get('batt_v', [])
-    t    = sensor_data_values.get('time', [])
-
-    do_v   = do[-1]   if do   else None
-    tmp_v  = tmp[-1]  if tmp  else None
-    pres_v = pres[-1] if pres else None
-    batt_v = batt[-1] if batt else None
-    t_v    = t[-1]    if t    else None
-
-    # Write to MAVProxy console (not just stdout)
-    self.console.writeln(
-        f"[HAUCS] t={t_v if t_v is not None else '--'} "
-        f"DO={do_v if do_v is not None else '--'} "
-        f"T={tmp_v if tmp_v is not None else '--'} "
-        f"P={pres_v if pres_v is not None else '--'} "
-        f"Batt={batt_v if batt_v is not None else '--'}"
-    )
-
 #### FIREBASE FUNCTIONS ####
 def login(key_dict):
     """
@@ -122,9 +100,6 @@ def login(key_dict):
     return firebase_admin.initialize_app(cred, {'databaseURL': 'https://haucs-monitoring-default-rtdb.firebaseio.com'})
 
 def logout(app):
-    """
-    Logout of a Firebase Instance
-    """
     firebase_admin.delete_app(app)
 
 def restart_firebase(app, key_dict):
@@ -145,52 +120,6 @@ def get_pond_table():
     
     return ponds
 
-'''
-#WIP!!! def reupload_data in the archieve
-def parse_all_sensor_data(root_path=sensor_root_dir):
-    field_map = load_field_mapping(FIELDS_CSV)
-    any_new_data = False
-
-    for entry in os.listdir(root_path):
-        if not re.match(r"^\d", entry):  # Skip if folder name doesn't start with a digit
-            continue
-            
-        if entry in excluded_sensors:
-            print(f"Skipping excluded sensor: {entry}")
-            continue
-
-        sensor_path = os.path.join(root_path, entry)
-        data_file = os.path.join(sensor_path, "data.txt")
-        print(data_file)
-        
-        if os.path.isdir(sensor_path) and os.path.exists(data_file):
-            print(f"\nChecking {entry}...")
-            last_ts = load_last_processed(entry)
-            #print(f"Loaded last_ts for {entry}: {last_ts}")
-            new_data = load_new_data(sensor_path, field_map, last_ts)
-
-            if not new_data.empty:
-                print(f"New data found for {entry}:")
-                detect_and_update_pond_id(entry, new_data)
-                latest_ts = new_data["timestamp"].max().strftime("%Y%m%d_%H:%M:%S")
-                success = enrich_and_upload_with_pressure(entry, new_data)     
-                #success = True # testing
-                if success == "success":
-                    save_last_processed(entry, latest_ts)
-                    archive_uploaded_data(entry, new_data, latest_ts)
-                    any_new_data = True
-                elif success == "upload_failed":
-                    print(f"Upload failed for {entry}. Will retry next time.")
-                elif success == "no_valid_data":
-                    print(f"No valid data (e.g., missing pressure) for {entry}.")
-                elif success == "no_data":
-                    print(f"No new data found for {entry}.")
-                else:
-                    print(f"Unexpected status '{status}' for {entry}")            
-                   
-    if not any_new_data:
-        print("No new data found in any sensor directory.")
-'''
 
 def save_json(sdata,sensor_file):
     with open(sensor_file, 'w') as outfile:
@@ -221,7 +150,10 @@ class haucs(mp_module.MPModule):
     def __init__(self, mpstate):
         """Initialise module"""
         super(haucs, self).__init__(mpstate, "haucs", "")
-        self.drone_id = "UNKNOWN"        
+        self._hooked_ids = set()
+        self._hooks_attached = 0
+        self.console.writeln("[haucs] loaded; will attach raw hooks as masters come up")
+        self.drone_id = "SPLASHY_UNK"        
         self.logged_in = False
         self.firebase_update = time.time()
         self.firebase_thread = False
@@ -280,6 +212,33 @@ class haucs(mp_module.MPModule):
         '''show help on command line options'''
         return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id"
 
+    def _masters(self):
+        mm = getattr(self.mpstate, "mav_master", None)
+        if mm is None:
+            return []
+        if isinstance(mm, (list, tuple)):
+            return [m for m in mm if m]
+        return [mm]
+
+    def _try_attach_hooks(self):
+        new = 0
+        for m in self._masters():
+            if hasattr(m, "message_hooks") and id(m) not in self._hooked_ids:
+                m.message_hooks.append(self._raw_hook)  # signature: (master, msg)
+                self._hooked_ids.add(id(m))
+                new += 1
+        if new:
+            self._hooks_attached += new
+            self.console.writeln(f"[haucs] raw hook attached on {new} master(s) (total {self._hooks_attached})")
+
+    # pymavlink calls hooks with (master, msg)
+    def _raw_hook(self, master, msg):
+        try:
+            self.mavlink_packet(msg)  # forward every message into your canonical handler
+        except Exception:
+            err = traceback.format_exc(limit=3).strip().replace("\n", " | ")
+            self.console.writeln(f"[haucs] mavlink_packet error: {err}")
+
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
         if len(args) == 0:
@@ -291,8 +250,6 @@ class haucs(mp_module.MPModule):
         elif args[0] == "sub":
             print("subscribing ...")
             self.extended_sys_subscribe()
-            #lidar_logger.init()
-            #lidar_logger.subscribe(self)
         elif args[0] == "login":
             with open('../fb_key.json', 'r') as file:
                 self.fb_key = file.read()
@@ -306,11 +263,9 @@ class haucs(mp_module.MPModule):
             logout(self.fb_app)
             print("logged out")
             self.logged_in = False
-
         elif args[0] == "do_init":
             if self.drone_variables.get('p_DO') == None:
                 print("initialization failed: DO sensor not connected")
-
             else:
                 if len(args) < 2:
                     self.cal_target = 30
@@ -355,6 +310,10 @@ class haucs(mp_module.MPModule):
 
     def idle_task(self):
         '''called rapidly by mavproxy'''
+        # ensure hooks are attached early
+        if self._hooks_attached == 0:
+            self._try_attach_hooks()
+            
         # update firebase with drone status
         update_time = 1
         if (time.time() - self.firebase_update) > update_time:
@@ -383,86 +342,100 @@ class haucs(mp_module.MPModule):
         # update pond data
         if (time.time() - self.payload_update) > 1:
             self.payload_update = time.time()
-            self.handle_pond()
-            self.handle_DO_cal(1)
+            #self.handle_pond()
+            #self.handle_DO_cal(1)
 
     def mavlink_packet(self, m):
         '''handle mavlink packets'''
-        print(f"msg type: {m.get_type()}")
-        if m.get_type() == 'NAMED_VALUE_FLOAT':
-            self.timers[m.get_type()] = time.time()
-            self.drone_variables[m.name] = round(m.value,2)
-            
-        elif m.get_type() == 'GLOBAL_POSITION_INT':
-            self.timers[m.get_type()] = time.time()
-            self.drone_variables['lat'] = m.lat/1e7
-            self.drone_variables['lon'] = m.lon/1e7
-            self.drone_variables['alt'] = m.alt/1000
-            self.drone_variables['hdg'] = m.hdg/100
-            self.drone_variables['vel'] = round(math.sqrt(m.vx**2 + m.vy**2 + m.vz**2)/100, 2)
-            lidar_logger.write([m.time_boot_ms, m.get_type(), m.lat, m.lon, m.alt, m.hdg, m.vx, m.vy, m.vz])
-            
-        elif m.get_type() == 'BATTERY_STATUS':
-            self.timers[m.get_type()] = time.time()
-            self.drone_variables['voltage'] = m.voltages[0]/1000
-            self.drone_variables['current'] = m.current_battery/100
-            self.drone_variables['mah_consumed'] = m.current_consumed
-            self.drone_variables['battery_remaining'] = m.battery_remaining
-            self.drone_variables['time_remaining'] = m.time_remaining
-            
-        elif m.get_type() == 'HEARTBEAT':
-            self.handle_heartbeat(m)
-            
-        elif m.get_type() == 'STATUSTEXT':
-            self.drone_variables['msg_severity'] = m.severity
-            self.drone_variables['msg'] = m.text
-            #handle unique id
-            msg = m.text.split(' ')
-            if msg[0] == 'CubeOrangePlus':
-                drone_id = " ".join(msg[1:])
-                if ID_LOOKUP.get(drone_id):
-                    self.drone_id = ID_LOOKUP[drone_id]
-            
-            ### determine final landing is next ##################
-            detect_mission_complete(m.text, st)
-            
-        elif m.get_type() == 'SYSTEM_TIME':
-            if m.time_boot_ms < self.time_boot_ms:
-                print("REBOOT DETECTED")
-                self.drone_variables['battery_time'] = 0
-            self.time_boot_ms = m.time_boot_ms
-            
-        elif m.get_type() in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
-            process_waypoint_request(self, m, self.master)
-            
-        elif m.get_type() == 'DISTANCE_SENSOR':
-            lidar_logger.write([m.time_boot_ms, m.get_type(), m.current_distance, 0, 0, 0, 0, 0, 0])
-            
-        elif m.get_type() == 'ATTITUDE':
-            lidar_logger.write([m.time_boot_ms, m.get_type(), m.roll, m.pitch, m.yaw, m.rollspeed, m.pitchspeed, m.yawspeed, 0])
-            
-        # use the EXTENDED_SYS_STATE to trigger sampling state machine
-        elif m.get_type() == "EXTENDED_SYS_STATE":
-            evt = handle_extsys_with_final(m.landed_state, st)
-            if evt == "INIT_TAKEOFF":
-                gcs_broadcast(self, "[GCS] INIT_TAKEOFF")
-            elif evt == "TAKEOFF":
-                gcs_broadcast(self, "[GCS] TAKEOFF")
-            elif evt == "TOUCHDOWN_INTERMEDIATE":
-                gcs_broadcast(self, "[GCS] Touchdown (sampling)")
-                self.sampling_lat = self.drone_variables['lat']
-                self.sampling_lng = self.drone_variables['lon']
+        try:
+            #self.console.writeln(f"msg type: {m.get_type()}")
+            if m.get_type() == 'NAMED_VALUE_FLOAT':
+                self.timers[m.get_type()] = time.time()
+                self.drone_variables[m.name] = round(m.value,2)
+                
+            elif m.get_type() == 'GLOBAL_POSITION_INT':
+                self.timers[m.get_type()] = time.time()
+                self.drone_variables['lat'] = m.lat/1e7
+                self.drone_variables['lon'] = m.lon/1e7
+                self.drone_variables['alt'] = m.alt/1000
+                self.drone_variables['hdg'] = m.hdg/100
+                self.drone_variables['vel'] = round(math.sqrt(m.vx**2 + m.vy**2 + m.vz**2)/100, 2)
+                lidar_logger.write([m.time_boot_ms, m.get_type(), m.lat, m.lon, m.alt, m.hdg, m.vx, m.vy, m.vz])
+                
+            elif m.get_type() == 'BATTERY_STATUS':
+                self.timers[m.get_type()] = time.time()
+                self.drone_variables['voltage'] = m.voltages[0]/1000
+                self.drone_variables['current'] = m.current_battery/100
+                self.drone_variables['mah_consumed'] = m.current_consumed
+                self.drone_variables['battery_remaining'] = m.battery_remaining
+                self.drone_variables['time_remaining'] = m.time_remaining
+                
+            elif m.get_type() == 'HEARTBEAT':
+                self.handle_heartbeat(m)
+                
+            elif m.get_type() == 'STATUSTEXT':
+                self.drone_variables['msg_severity'] = m.severity
+                self.drone_variables['msg'] = m.text
+                #handle unique id
+                msg = m.text.split(' ')
+                if msg[0] == 'CubeOrangePlus':
+                    drone_id = " ".join(msg[1:])
+                    if ID_LOOKUP.get(drone_id):
+                        self.drone_id = ID_LOOKUP[drone_id]
+                
+                ### determine final landing is next ##################
+                detect_mission_complete(m.text, st)
+                
+            elif m.get_type() == 'SYSTEM_TIME':
+                if m.time_boot_ms < self.time_boot_ms:
+                    print("REBOOT DETECTED")
+                    self.drone_variables['battery_time'] = 0
+                self.time_boot_ms = m.time_boot_ms
+                
+            elif m.get_type() in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
+                process_waypoint_request(self, m, self.master)
+                
+            elif m.get_type() == 'DISTANCE_SENSOR':
+                lidar_logger.write([m.time_boot_ms, m.get_type(), m.current_distance, 0, 0, 0, 0, 0, 0])
+                
+            elif m.get_type() == 'ATTITUDE':
+                lidar_logger.write([m.time_boot_ms, m.get_type(), m.roll, m.pitch, m.yaw, m.rollspeed, m.pitchspeed, m.yawspeed, 0])
+                
+            # use the EXTENDED_SYS_STATE to trigger sampling state machine
+            elif m.get_type() == "EXTENDED_SYS_STATE":
+                evt = handle_extsys_with_final(m.landed_state, st)
+                if evt == "INIT_TAKEOFF":
+                    gcs_broadcast(self, "[GCS] INIT_TAKEOFF")
+                elif evt == "TAKEOFF":
+                    gcs_broadcast(self, "[GCS] TAKEOFF")
+                elif evt == "TOUCHDOWN_INTERMEDIATE":
+                    gcs_broadcast(self, "[GCS] Touchdown (sampling)")
+                    self.sampling_lat = self.drone_variables['lat']
+                    self.sampling_lng = self.drone_variables['lon']
 
-                self.pond_id=get_pond_id(self.sampling_lat, self.sampling_lng)
-                print("Locked GPS:", self.sampling_lat, self.sampling_lng)
-            elif evt == "TOUCHDOWN_FINAL":
-                gcs_broadcast(self, "[GCS] Touchdown (FINAL)")
+                    self.pond_id=get_pond_id(self.sampling_lat, self.sampling_lng)
+                    print("Locked GPS:", self.sampling_lat, self.sampling_lng)
+                elif evt == "TOUCHDOWN_FINAL":
+                    gcs_broadcast(self, "[GCS] Touchdown (FINAL)")
+            
+            # handles data packets
+            elif m.get_type() == "DATA96":
+                self.console.writeln(f"msg type: {m.get_type()}")
+                #data = bytes(bytearray(getattr(m, "data", b"")))
+                #ln = getattr(m, "len", 0) or 0
+                #payload = data[:ln]
+                #if len(payload) >= 20:
+                #    seq, unix_ts, tempC, press_kPa, DO_mgL = struct.unpack("<IIfff", payload[:20])
+                #    # store or display
+                #    self.console.writeln(
+                #        f"[haucs] D96 seq={seq} T={tempC:.2f}C P={press_kPa:.2f}kPa DO={DO_mgL:.2f}"
+                #    )
+
+                self.proc_sensordata(m)
+        except Exception as e:
+                # never let one bad packet kill the whole dispatcher
+                self.console.writeln(f"[haucs] mavlink handler error: {type(e).__name__}: {e}")
         
-        # handles data packets
-        elif m.get_type() == "DATA96":
-            self.proc_sensordata(m)
-            self._print_latest()  
-
     def proc_sensordata(self, m):
         payload = bytes(m.data)[:m.len]      
         seq_id, is_resend, var_id, var_len, values, flags = msg_decoder(payload)
@@ -470,9 +443,9 @@ class haucs(mp_module.MPModule):
         if name is not None:              
             sensor_data_values[name].extend(values)
         else:
-            print(f"[haucs] unknown var_id: {var_id}")
+            self.console.writeln(f"[haucs] unknown var_id: {var_id}")
             return               
-        print(f"PC got var {var_id} seq {seq_id} resend {is_resend} len {var_len} flags {flags}")
+        self.console.writeln(f"PC got var {var_id} seq {seq_id} resend {is_resend} len {var_len} flags {flags}")
         if flags == FLAG_SOF:
             print("PC start of frame")
         elif flags == FLAG_EOF or flags == FLAG_SOLO:
@@ -514,7 +487,7 @@ class haucs(mp_module.MPModule):
             except Exception as e:
                 #logger.warning("uploading data to firebase failed")
                 self.fb_app = restart_firebase(self.fb_app, self.fb_key)
-                print(f"uploading data to firebase failed: {e}")
+                self.console.writeln(f"uploading data to firebase failed: {e}")
                 append_json('upload',0,sensor_file) # update the upload status - to prepare for retry
     
     def handle_heartbeat(self, m):
