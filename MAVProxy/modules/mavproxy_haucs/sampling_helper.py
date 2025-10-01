@@ -11,20 +11,6 @@ NAV_IN_AIR    = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
 NAV_ON_GROUND = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
 
 # -------------------- Mission utils --------------------
-def gcs_brocast(self, txt, sev=mavutil.mavlink.MAV_SEVERITY_INFO):
-    """Broadcast a STATUSTEXT and print locally."""
-    try:
-        self.master.mav.statustext_send(sev, txt.encode('utf-8')[:249])
-    except Exception:
-        pass
-    self.console.writeln(f"[phasewatch] {txt}")
-
-from pymavlink import mavutil
-import time
-
-# --- knobs ---
-TOUCH_CONFIRM_SEC = 2.0  # small settle to avoid bounce
-
 def detect_mission_complete(statustext, st):
     """
     If a STATUSTEXT contains 'mission complete',
@@ -62,7 +48,6 @@ def handle_extsys_with_final(landed_state, st):
         st['touch_t0'] = None
         st['touch_confirmed'] = False
 
-    # Landing with tiny settle
     if landed_state == NAV_ON_GROUND:
         if last != NAV_ON_GROUND:
             st['touch_t0'] = now

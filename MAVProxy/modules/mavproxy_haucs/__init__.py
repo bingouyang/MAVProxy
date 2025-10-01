@@ -2,6 +2,7 @@ from MAVProxy.modules.lib import mp_module, mp_util, mp_settings
 from MAVProxy.modules.mavproxy_haucs import path_planner
 from MAVProxy.modules.mavproxy_haucs import lidar_logger
 from MAVProxy.modules.mavproxy_haucs.waypoint_helper import *
+from MAVProxy.modules.mavproxy_haucs.sampling_helper import *
 
 from pymavlink import mavutil, mavwp
 import firebase_admin
@@ -170,7 +171,9 @@ class haucs(mp_module.MPModule):
                                 "battery_time":0,
                                 "flight_time":0,
                                 "mission_time":0,
-                                "arm_state":"disarmed",}
+                                "arm_state":"disarmed",
+                                "current":0,
+                                }
         self.on_water = False
         self.pond_table = get_pond_table()
         self.pond_data = {"do":[],
@@ -407,18 +410,18 @@ class haucs(mp_module.MPModule):
             elif m.get_type() == "EXTENDED_SYS_STATE":
                 evt = handle_extsys_with_final(m.landed_state, st)
                 if evt == "INIT_TAKEOFF":
-                    gcs_broadcast(self, "[GCS] INIT_TAKEOFF")
+                    self.console.writeln("INIT_TAKEOFF") 
                 elif evt == "TAKEOFF":
-                    gcs_broadcast(self, "[GCS] TAKEOFF")
+                    self.console.writeln("SAMPLING_TAKEOFF") 
                 elif evt == "TOUCHDOWN_INTERMEDIATE":
-                    gcs_broadcast(self, "[GCS] Touchdown (sampling)")
+                    self.console.writeln("Touchdown (sampling)") 
+                    # locking GPS and pond id
                     self.sampling_lat = self.drone_variables['lat']
                     self.sampling_lng = self.drone_variables['lon']
-
                     self.pond_id=get_pond_id(self.sampling_lat, self.sampling_lng)
-                    print("Locked GPS:", self.sampling_lat, self.sampling_lng)
+                    self.console.writeln(f"Locked GPS: {self.sampling_lat}, {self.sampling_lng}")
                 elif evt == "TOUCHDOWN_FINAL":
-                    gcs_broadcast(self, "[GCS] Touchdown (FINAL)")
+                    self.console.writeln("Touchdown (FINAL)")
             
             # handles data packets
             elif m.get_type() == "DATA96":
@@ -432,7 +435,6 @@ class haucs(mp_module.MPModule):
                 #    self.console.writeln(
                 #        f"[haucs] D96 seq={seq} T={tempC:.2f}C P={press_kPa:.2f}kPa DO={DO_mgL:.2f}"
                 #    )
-
                 self.proc_sensordata(m)
         except Exception as e:
                 # never let one bad packet kill the whole dispatcher
