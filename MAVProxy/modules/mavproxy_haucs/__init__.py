@@ -24,8 +24,6 @@ import traceback, time
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy --out 172.20.10.5:14550
 # mavproxy.py --master=udp:127.0.0.1:14550 --aircraft=splashy
 
-
-
 LANDED_STATE = {0:'unknown',
                 1:'landed',
                 2:'in air',
@@ -45,15 +43,6 @@ sensor_data_names = {
     6: "batt_v",
 }
 
-sensor_data_values = {
-    "time": [],
-    "DO": [],
-    "temp": [],
-    "pressure": [],
-    "init_DO":[],
-    "init_pressure":[],
-    "batt_v":[],
-}
 # payload and header for encoding
 DATA_BYTES = 96
 HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
@@ -85,7 +74,7 @@ SENSORDIR = r'C:\SENSOR_DATA_ARCHIVE'
 ################# param for comm with PI ################################
 PC_SYSID = 255
 PC_COMP = 1
-PI_SYSID = 200
+PI_SYSID = 1
 PORT = 5770
 ########################################################################
 
@@ -94,10 +83,6 @@ ID_LOOKUP = {'003A003C 30325113 37363931':'SPLASHY_1',
 
 #### FIREBASE FUNCTIONS ####
 def login(key_dict):
-    """
-    Start a Firebase Instance
-    return: an app instance
-    """
     data = json.loads(key_dict)
     cred = credentials.Certificate(data)
     return firebase_admin.initialize_app(cred, {'databaseURL': 'https://haucs-monitoring-default-rtdb.firebaseio.com'})
@@ -114,16 +99,12 @@ def restart_firebase(app, key_dict):
 def get_pond_table():
     with open("ponds.json") as file:
         data = json.load(file)
-
     ponds = {}
     for i in data['features']:
         id = i['properties']['number']
         coords = i['geometry']['coordinates'][0]
         ponds[id] = Polygon(coords)
-    
     return ponds
-
-
 
 def save_json(sdata,sensor_file):
     with open(sensor_file, 'w') as outfile:
@@ -167,6 +148,7 @@ class haucs(mp_module.MPModule):
                        "BATTERY_STATUS":time.time(),
                        "GLOBAL_POSITION_INT":time.time(),
                        "GCS_HBEAT":time.time()}
+
         self.drone_variables = {"p_pres":0,
                                 "on_water":False,
                                 "battery_time":0,
@@ -174,14 +156,15 @@ class haucs(mp_module.MPModule):
                                 "mission_time":0,
                                 "arm_state":"disarmed",
                                 "current":0,
-                                "pond_id":"pond_ukn",
                                 }
         self.on_water = False
         self.pond_table = get_pond_table()
         self.pond_data = {"do":[],
                           "pressure":[],
                           "temp":[],
-                          "pond_id":"pond_ukn"}
+                          "pond_id":"wukn",
+                          "seq":0,
+                          }
         self.pressure_threshold = 1024
         self.initial_data = {"DO":0, "pressure":0}
         self.cal_count = 0
@@ -194,6 +177,16 @@ class haucs(mp_module.MPModule):
         self.haucs_settings = mp_settings.MPSettings(
             [ ('verbose', bool, False),])
         self.add_command('haucs', self.cmd_haucs, "haucs module", ['status','set (LOGSETTING)'])
+        
+        # montioring servo events
+        self.locked_fix = None                         # (lat, lon) when edge detected
+        self.gps_fix = {"lat": None, "lon": None}      # latest fix from GLOBAL_POSITION_INT
+        self.servo_mon = {
+            "chan": 9,          # <== set your winch/servo channel here (1..16)
+            "on_th": 1700,      # rising edge when pwm crosses >= on_th
+            "off_th": 1300,     # (hysteresis lower band)
+            "state": 0          # 0=OFF, 1=ON (debounced)
+        }
 
         ################################
         # initialize take/off land status
@@ -201,6 +194,20 @@ class haucs(mp_module.MPModule):
         
         self.sampling_lat = 0.0
         self.sampling_lng = 0.0
+        
+
+        # ----- per-frame aggregator (single-upload-per-frame) -----
+        self._var_id_frame_end = 127   # must match Pi side
+        self._last_uploaded_seq = None # idempotency guard
+        self._sensor_data_values = {
+            "DO": [], "temp": [], "pressure": [],
+            "init_DO": [], "init_pressure": [], "batt_v": []
+        }
+        # keep time separately
+        self._time_buf = []
+        self._frame_seq = None
+        self._frame_done = set()
+
         try:
             lidar_logger.init()
             lidar_logger.subscribe(self)
@@ -222,7 +229,7 @@ class haucs(mp_module.MPModule):
         location = Point(coord)
         #get last do measurement
         #get current pond
-        pond_id = "unknown"
+        pond_id = "wukn"
         for i in self.pond_table:
             if self.pond_table[i].contains(location):
                 pond_id = str(i)
@@ -403,7 +410,7 @@ class haucs(mp_module.MPModule):
                     drone_id = " ".join(msg[1:])
                     if ID_LOOKUP.get(drone_id):
                         self.drone_id = ID_LOOKUP[drone_id]
-                
+
                 ### determine final landing is next ##################
                 detect_mission_complete(m.text, st)
                 
@@ -429,91 +436,155 @@ class haucs(mp_module.MPModule):
                     self.console.writeln("INIT_TAKEOFF") 
                 elif evt == "TAKEOFF":
                     self.console.writeln("SAMPLING_TAKEOFF") 
-                elif evt == "TOUCHDOWN_INTERMEDIATE":
-                    self.console.writeln("Touchdown (sampling)") 
+                
+                elif evt == "TOUCHDOWN_SAMPLING":
+                    self.console.writeln("Touchdown (sampling)")
+                    
+                elif evt == "TOUCHDOWN_FINAL":
+                    self.console.writeln("Touchdown (FINAL)")
+
+            elif m.get_type() == 'SERVO_OUTPUT_RAW':
+                # Map channel to MAVLink port + index (8 channels per port)
+                ch = int(self.servo_mon["chan"])
+                port_needed = (ch - 1) // 8     # ch 1..8 -> 0, 9..16 -> 1
+                idx = (ch - 1) % 8 + 1          # 1..8
+                # Only process the message for the matching port
+                if getattr(m, "port", 0) != port_needed:
+                    return
+                pwm = getattr(m, f"servo{idx}_raw", None)
+                if pwm is None:
+                    return
+                prev = self.servo_mon["state"]
+                on_th, off_th = self.servo_mon["on_th"], self.servo_mon["off_th"]
+
+                # Lock in lat/lng at the rising edge of servo
+                if prev == 0 and pwm >= on_th:
+                    self.servo_mon["state"] = 1
+                    # Lock the current lat/lon (if available)
+                    self.console.writeln("Serov Rising Edge (ready for sampling)")
                     # locking GPS and pond id
                     self.sampling_lat = self.drone_variables['lat']
                     self.sampling_lng = self.drone_variables['lon']
                     self.pond_data['pond_id']=self.get_pond_id()
                     self.console.writeln(f"Locked GPS: {self.sampling_lat}, {self.sampling_lng} for pond: {self.pond_data['pond_id']}")
-                elif evt == "TOUCHDOWN_FINAL":
-                    self.console.writeln("Touchdown (FINAL)")
-            
-            # handles data packets
-            elif m.get_type() == "DATA96":
-                self.console.writeln(f"msg type: {m.get_type()}")
-                #data = bytes(bytearray(getattr(m, "data", b"")))
-                #ln = getattr(m, "len", 0) or 0
-                #payload = data[:ln]
-                #if len(payload) >= 20:
-                #    seq, unix_ts, tempC, press_kPa, DO_mgL = struct.unpack("<IIfff", payload[:20])
-                #    # store or display
-                #    self.console.writeln(
-                #        f"[haucs] D96 seq={seq} T={tempC:.2f}C P={press_kPa:.2f}kPa DO={DO_mgL:.2f}"
-                #    )
+                elif prev == 1 and pwm <= off_th: 
+                    # Update state (falling edge)
+                    self.servo_mon["state"] = 0
+                    
+            # handles data packets when the servo is engaged.
+            elif m.get_type() == "DATA96" and self.servo_mon["state"]==1:
                 self.proc_sensordata(m)
+                
         except Exception as e:
                 err = traceback.format_exc(limit=1)  # 1 = just the last frame
                 self.console.writeln(f"[haucs] handler error: {err.strip()}")
                 # never let one bad packet kill the whole dispatcher
                 #self.console.writeln(f"[haucs] mavlink handler error: {type(e).__name__}: {e}")
-        
-    def proc_sensordata(self, m):
-        payload = bytes(m.data)[:m.len]      
-        seq_id, is_resend, var_id, var_len, values, flags = msg_decoder(payload)
-        name = sensor_data_names.get(var_id)
-        if name is not None:              
-            sensor_data_values[name].extend(values)
-        else:
-            self.console.writeln(f"[haucs] unknown var_id: {var_id}")
-            return               
-        self.console.writeln(f"PC got var {var_id} seq {seq_id} resend {is_resend} len {var_len} flags {flags}")
-        if flags == FLAG_SOF:
-            print("PC start of frame")
-        elif flags == FLAG_EOF or flags == FLAG_SOLO:
-            print("PC end of frame")
-            message_time = time.strftime('%Y%m%d_%H%M%S', time.gmtime(time.time()))
-            os.makedirs(SENSORDIR, exist_ok=True)
-            sensor_file= os.path.join(SENSORDIR, f'{message_time}.json')
-            #send_pond_data
-            try:                
-                drone_id =self.drone_id #hard code it for now
-                pond_id  =self.pond_data['pond_id']
-                do_array = sensor_data_values['DO']
-                temp_array = sensor_data_values['temp']
-                pres_array = sensor_data_values['pressure']
-                ####################################################################
-                # being lazy... pading init_DO, init_pressure, batt_v to same length as data,
-                # here just grab one value.
-                init_DO_list = sensor_data_values['init_DO']
-                init_pressure_list = sensor_data_values['init_pressure']
-                batt_v_list = sensor_data_values['batt_v']
-                init_DO       = init_DO_list[0] if init_DO_list else 0.0
-                init_pressure = init_pressure_list[0] if init_pressure_list else 0.0
-                batt_v        = batt_v_list[0] if batt_v_list else 0.0
-                lat = getattr(self, "sampling_lat", None)   ### CHANGED (safer access)
-                lng = getattr(self, "sampling_lng", None)   ### CHANGED (fix: you had sampling_lng)
+    def _reset_for_new_seq(self, new_seq):
+        self._frame_seq = new_seq
+        self._frame_done.clear()
+        for k in self._sensor_data_values:
+            self._sensor_data_values[k] = []
+        self._time_buf = []
 
-                data = {'do': do_array, 'init_do': init_DO, 'init_pressure': init_pressure,
-                        'lat': lat, 'lng': lng, 'pid': str(pond_id), 'pressure': pres_array, 'sid': drone_id,
-                        'temp': temp_array,
-                        'batt_v': batt_v, 'type': 'winch'}
-                
-                save_json(data,sensor_file) # save the data
-                # clear the current back of sensor data
-                for k in sensor_data_values:
-                    sensor_data_values[k] = []
-                    
-                db.reference(f"LH_Farm/pond_{pond_id}/{message_time}/").set(data)
-                append_json('upload',1,sensor_file) # update the upload status
-            except Exception as e:
-                #logger.warning("uploading data to firebase failed")
-                err = traceback.format_exc(limit=1)  # 1 = just the last frame
-                self.console.writeln(f"[haucs] file error: {err.strip()}")
+    def proc_sensordata(self, m):
+        try:
+            payload = bytes(m.data)[:m.len]
+            seq_id, is_resend, var_id, var_len, values, flags = msg_decoder(payload)
+            name = sensor_data_names.get(var_id)
+            #print(f"seq_id:{seq_id}, var_id:{var_id}, var_len:{var_len}, values:{values}, name:{name}")
+            if self._frame_seq is None:
+                self._reset_for_new_seq(seq_id)
+            # --- special streams ---
+            if name == "time":
+                self._time_buf = list(values) if values else []
+                return
+
+            # End-of-frame control (Pi sends values=list(b"CONTROL"); we ignore content)
+            if (var_id == self._var_id_frame_end) or (name == "frame_end"):
+                print(f"var_id:{var_id}, name:{name}")
+                self._commit_current(seq_id,"frame_end")
+                return
+            # --- regular variables: accumulate into your existing buffers ---
+            if name in self._sensor_data_values:
+                if values:
+                    self._sensor_data_values[name].extend(values)
+                # optional: keep EOF tracking for debugging/logging only
+                if flags in (FLAG_EOF, FLAG_SOLO):
+                    self._frame_done.add(name)
+                return
+
+            # Unknown var id/name – ignore safely
+            return
+
+        except Exception as e:
+            err = traceback.format_exc(limit=1)
+            self.console.writeln(f"[haucs] file error: {err.strip()}")
+            # try to recover FB; don't assume sensor_file exists here
+            try:
                 self.fb_app = restart_firebase(self.fb_app, self.fb_key)
-                self.console.writeln(f"uploading data to firebase failed: {e}")
-                append_json('upload',0,sensor_file) # update the upload status - to prepare for retry
-    
+            except Exception:
+                pass
+            self.console.writeln(f"uploading data to firebase failed: {e}")
+
+    def _commit_current(self, end_seq, reason):
+        print(f"end_seq:{end_seq}, self._last_uploaded_seq:{self._last_uploaded_seq}")
+        if self._last_uploaded_seq == end_seq:
+            return
+        else:
+            # assemble payload
+            message_time_file = time.strftime('%Y%m%d_%H%M%S', time.gmtime(time.time()))
+            message_time = time.strftime('%Y%m%d_%H:%M:%S', time.gmtime(time.time()))
+
+            os.makedirs(SENSORDIR, exist_ok=True)
+            sensor_file = os.path.join(SENSORDIR, f'{message_time_file}.json')
+            seq = self.pond_data.get('seq', 0)
+            drone_id = self.drone_id
+            pond_id  = self.pond_data.get('pond_id', 'wukn')
+
+            vals = self._sensor_data_values
+            do_array   = vals.get('DO', [])
+            temp_array = vals.get('temp', [])
+            pres_array = vals.get('pressure', [])
+
+            init_DO_list       = vals.get('init_DO', [])
+            init_pressure_list = vals.get('init_pressure', [])
+            batt_v_list        = vals.get('batt_v', [])
+
+            init_DO       = init_DO_list[0] if init_DO_list else 0.0
+            init_pressure = init_pressure_list[0] if init_pressure_list else 0.0
+            batt_v        = batt_v_list[0] if batt_v_list else 0.0
+
+            lat = getattr(self, "sampling_lat", None)
+            lng = getattr(self, "sampling_lng", None)
+
+            data = {
+                'seq': int(seq),
+                'sid': drone_id,
+                'pid': str(pond_id),
+                'lat': lat, 'lng': lng,
+                'type': 'winch',
+                'do': do_array, 'temp': temp_array, 'pressure': pres_array,
+                'init_do': init_DO, 'init_pressure': init_pressure,
+                'batt_v': batt_v
+            }
+            try:
+                save_json(data, sensor_file)
+                db.reference(f"LH_Farm/pond_{pond_id}/{message_time}/").set(data)
+                print(f"db upload data: {data}")
+                self.pond_data['seq'] = self.pond_data.get('seq', 0) + 1
+                append_json('upload', 1, sensor_file)
+            except Exception as e:
+                err = traceback.format_exc(limit=1)
+                self.console.writeln(f"[haucs] upload error: {err.strip()}")
+            finally:
+                # Finalize the frame regardless of success/failure
+                self._last_uploaded_seq = end_seq                 # ignore duplicate end markers for this seq
+                self.pond_data["seq"] = self.pond_data.get("seq", 0) + 1
+                self._reset_for_new_seq(None)     # clear buffers & ready for next frame
+                print(f"updating seq:{seq}, self._last_uploaded_seq:{self._last_uploaded_seq}")
+                print(f"[haucs] committed seq={end_seq} reason={reason}")
+
     def handle_heartbeat(self, m):
         #flight mode
         mode = FLIGHT_MODE.get(m.custom_mode)
@@ -533,8 +604,10 @@ class haucs(mp_module.MPModule):
     def idle_firebase_update(self, data):     
         try:
             db.reference('LH_Farm/drone/' + self.drone_id + '/data').set(data)
-        except:
-            print("FAILED FIREBASE UPDATE: no internet likely cause")
+            #print(f"idle_update:drone:{self.drone_id},{data}")
+        except Exception as e:
+            err = traceback.format_exc(limit=1)
+            print(f"[haucs] db idle upload error: {err.strip()}")
         self.firebase_thread = False
 
     def gen_mission(self, home, testing, args):

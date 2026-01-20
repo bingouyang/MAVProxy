@@ -32,11 +32,8 @@ def handle_extsys_with_final(landed_state, st):
           'final_pending': False
         }
     Returns one of: 'INIT_TAKEOFF', 'TAKEOFF',
-                    'TOUCHDOWN_INTERMEDIATE', 'TOUCHDOWN_FINAL', or None
+                    'TOUCHDOWN_SAMPLING', 'TOUCHDOWN_FINAL', or None
     """
-    import time
-    from pymavlink import mavutil
-
     now  = time.time()
     last = st.get('last')
     evt  = None
@@ -59,8 +56,7 @@ def handle_extsys_with_final(landed_state, st):
                     evt = "TOUCHDOWN_FINAL"
                     st['final_pending'] = False  # consume the flag
                 else:
-                    evt = "TOUCHDOWN_INTERMEDIATE"
-
+                    evt = "TOUCHDOWN_SAMPLING" 
     st['last'] = landed_state
     return evt
 
