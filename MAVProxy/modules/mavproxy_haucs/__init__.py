@@ -118,6 +118,7 @@ def append_json(key,value,sensor_file):
         json.dump(data, file, indent=4)
 
 # -------------------- Msg Decoder --------------------
+'''
 def msg_decoder(buf):
     seq_id = struct.unpack_from("!I", buf, 0)[0]
     var_byte = buf[4]
@@ -130,7 +131,7 @@ def msg_decoder(buf):
     var_id = var_byte & 0x7F
     values = [var_base + r / SCALE for r in residues]
     return seq_id, is_resend, var_id, var_len, values, flags
-
+'''
 class haucs(mp_module.MPModule):
     def __init__(self, mpstate):
         """Initialise module"""
@@ -194,8 +195,6 @@ class haucs(mp_module.MPModule):
         
         self.sampling_lat = 0.0
         self.sampling_lng = 0.0
-        
-
         # ----- per-frame aggregator (single-upload-per-frame) -----
         self._var_id_frame_end = 127   # must match Pi side
         self._last_uploaded_seq = None # idempotency guard

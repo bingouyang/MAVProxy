@@ -63,7 +63,7 @@ def handle_extsys_with_final(landed_state, st):
 SEND_ORDER = ["time","do", "temp", "press"] 
 VAR_MAP = {"time": 0, "do": 1, "temp": 2, "press": 3}
 # -------------------- Msg Decoder --------------------
-def parse_inner(buf):
+def msg_decoder(buf):
     seq_id = struct.unpack_from("!I", buf, 0)[0]
     var_byte = buf[4]
     var_base = struct.unpack_from("!h", buf, 5)[0]

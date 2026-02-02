@@ -3,6 +3,7 @@ cd ..
 python setup.py build install --user
 REM Using ArduPilot-specific MAVLink message set.
 set MAVLINK_DIALECT=ardupilotmega
+
 REM Using MAVLink v2.0 encoding.
 set MAVLINK20=1
 

@@ -5,3 +5,4 @@ pandas
 ortools
 shapely
 firebase_admin
+cryptography
