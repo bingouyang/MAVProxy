@@ -177,7 +177,7 @@ class haucs(mp_module.MPModule):
         
         self.haucs_settings = mp_settings.MPSettings(
             [ ('verbose', bool, False),])
-        self.add_command('haucs', self.cmd_haucs, "haucs module", ['status','set (LOGSETTING)'])
+        self.add_command('haucs', self.cmd_haucs, "haucs module", ['status','set (LOGSETTING)','gen_mission_winch','gen_mission'])
         
         # montioring servo events
         self.locked_fix = None                         # (lat, lon) when edge detected
@@ -333,6 +333,71 @@ class haucs(mp_module.MPModule):
                 print("set drone id\nexample: haucs set_id SPLASHY_1")
             else:
                 self.drone_id = args[1]
+        elif args[0] == "gen_mission_winch":
+            # NEW WINCH FORMAT: NAV_LAND + DO_SET_SERVO servo sequence
+            # *** DIFFERENT FROM gen_mission — read prompts carefully ***
+            # Usage: haucs gen_mission_winch <source> <alt> <upload_alt> <stab_sec> <soak_sec>
+            # Example: haucs gen_mission_winch points 15 10 3 60
+            if len(args) != 6:
+                print("gen_mission_winch usage:")
+                print("  haucs gen_mission_winch <source> <alt> <upload_alt> <stab_sec> <soak_sec>")
+                print("  source     : CSV file with pond lat/lon (no .csv extension needed)")
+                print("  alt        : cruise altitude AGL in metres (e.g. 15)")
+                print("  upload_alt : min altitude before data upload trigger (e.g. 10)")
+                print("  stab_sec   : stabilization delay after landing in seconds (e.g. 3)")
+                print("  soak_sec   : soak time on water in seconds (e.g. 60)")
+                print("")
+                print("  Example: haucs gen_mission_winch points 15 10 3 60")
+                print("")
+                print("  *** NEW FORMAT — servo sequence has changed from gen_mission ***")
+                print("  *** ch8=1500 neutral, ch8=1900 deploy, ch8=1200 upload      ***")
+                print("  *** Set SCR_USER1/2/3 in Mission Planner for winch timing   ***")
+                print("  *** soak_sec must be >= SCR_USER1 + SCR_USER2 + SCR_USER3   ***")
+                print("  *** Verify in Mission Planner before uploading to drone     ***")
+            else:
+                source = args[1] if args[1].endswith(".csv") else args[1] + ".csv"
+                output = args[1].replace(".csv", "") + "_winch.waypoints"
+
+                if not self.drone_variables.get("lat"):
+                    print("!!!TEST MODE!!!: no GPS fix -- using lab coordinates for home")
+                    home = (27.535321985800824, -80.35167917904866, 0)
+                else:
+                    home = (self.drone_variables["lat"],
+                            self.drone_variables["lon"],
+                            self.drone_variables["alt"])
+
+                mission_args = {
+                    "home"      : home,
+                    "source"    : source,
+                    "output"    : output,
+                    "alt"       : int(args[2]),
+                    "upload_alt": int(args[3]),
+                    "stab_sec"  : float(args[4]),
+                    "soak_sec"  : float(args[5]),
+                    "winch"     : True,
+                    # legacy keys needed by path_planner.main() internals
+                    "delay"     : float(args[5]),
+                    "dive"      : int(args[2]),
+                    "land"      : "true",
+                }
+
+                for k, v in mission_args.items():
+                    if k != "home":
+                        print("  {:>12}: {}".format(k, v))
+
+                sorted_coords = path_planner.main(self, mission_args)
+                if sorted_coords and self.drone_variables.get("lat"):
+                    sorted_coords_full = (
+                        [[home[0], home[1]]]
+                        + [[c[0], c[1]] for c in sorted_coords]
+                        + [[home[0], home[1]]]
+                    )
+                    try:
+                        db.reference("LH_Farm/drone/" + self.drone_id + "/mission/").set(sorted_coords_full)
+                        print("Mission uploaded to Firebase: LH_Farm/drone/" + self.drone_id + "/mission/")
+                    except Exception as e:
+                        print("Firebase upload failed: {}".format(e))
+
         elif args[0] == "gen_mission":
             if len(args) != 6:
                 print("gen_mission <source> (.csv) <alt> (meters) <delay> (seconds) <land> (True/False) <dive> (0 < x < alt)")

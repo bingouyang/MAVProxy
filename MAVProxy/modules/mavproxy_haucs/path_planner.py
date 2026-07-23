@@ -99,6 +99,175 @@ def generate_mission(args, coords):
         index += 1
         m.write(f"{index}\t0\t3\t20\t0\t0\t0\t0\t0\t0\t0\t1\n") #RTL
 
+
+# ── WINCH MISSION GENERATOR ───────────────────────────────────────────────────
+# NEW FORMAT — distinct from generate_mission() above.
+# DO NOT merge these two functions — servo sequence and landing logic differ.
+#
+# Mission structure per pond:
+#   NAV_TAKEOFF (cruise_alt)
+#   DO_SET_SERVO ch8=1500   neutral/safe at takeoff
+#   NAV_WAYPOINT (pond)     fly to pond
+#   NAV_LAND                land on water (FC gates here until touchdown confirmed)
+#   NAV_DELAY (stab_sec)    stabilization after landing
+#   DO_SET_SERVO ch8=1900   trigger winch DEPLOY
+#   NAV_DELAY (soak_sec)    soak time (must cover RELEASE_SEC+PAUSE_SEC+RETRACT_SEC)
+#                           set SCR_USER1/2/3 in Mission Planner to tune winch timing
+#   NAV_TAKEOFF (cruise_alt)
+#   CONDITION_CHANGE_ALT    wait until upload_alt reached
+#   DO_SET_SERVO ch8=1200   trigger data UPLOAD at altitude
+#   ... repeat per pond ...
+#   RTL
+
+_SERVO_CH      = 8
+_SERVO_NEUTRAL = 1500   # safe/neutral — set at every takeoff
+_SERVO_DEPLOY  = 1900   # winch deploy — set after landing confirmed
+_SERVO_UPLOAD  = 1200   # data upload  — set after climbing to upload_alt
+
+_CMD_TAKEOFF     = 22
+_CMD_WAYPOINT    = 16
+_CMD_LAND        = 21
+_CMD_DELAY       = 93
+_CMD_DO_SERVO    = 183
+_CMD_COND_ALT    = 113
+_CMD_RTL         = 20
+_FRAME_REL       = 3    # relative altitude (AGL)
+_FRAME_MISSION   = 2    # no position
+
+
+def _wprow(seq, current, frame, cmd,
+           p1=0, p2=0, p3=0, p4=0,
+           lat=0, lon=0, alt=0, autocontinue=1):
+    return (f"{seq}\t{current}\t{frame}\t{cmd}\t"
+            f"{p1:.8f}\t{p2:.8f}\t{p3:.8f}\t{p4:.8f}\t"
+            f"{lat:.8f}\t{lon:.8f}\t{alt:.6f}\t{autocontinue}")
+
+
+def generate_mission_winch(args, coords):
+    """
+    Generates a winch-drone mission .waypoints file.
+
+    *** NEW FORMAT — verify in Mission Planner before uploading ***
+    *** DO NOT reuse old .waypoints files — servo sequence has changed ***
+
+    args keys:
+        home        (lat, lon, alt) tuple
+        output      output filename (.waypoints)
+        alt         cruise altitude AGL in metres
+        upload_alt  minimum altitude before data upload trigger (m)
+        stab_sec    stabilization delay after landing (s)
+        soak_sec    soak time on water — must cover full winch cycle (s)
+                    must be >= SCR_USER1 + SCR_USER2 + SCR_USER3
+    coords:
+        list of (lat, lon) tuples, TSP-sorted by caller
+    """
+    home       = args['home']
+    alt        = float(args['alt'])
+    upload_alt = float(args.get('upload_alt', min(10, alt)))
+    stab_sec   = float(args.get('stab_sec', 3))
+    soak_sec   = float(args.get('soak_sec', 60))
+    output     = args['output']
+
+    print()
+    print("=" * 62)
+    print("  HAUCS WINCH MISSION GENERATOR  *** NEW FORMAT ***")
+    print("=" * 62)
+    print(f"  Servo ch{_SERVO_CH} mapping:")
+    print(f"    {_SERVO_NEUTRAL} = NEUTRAL  (set at every takeoff — safety)")
+    print(f"    {_SERVO_DEPLOY} = DEPLOY   (set after landing on water confirmed)")
+    print(f"    {_SERVO_UPLOAD} = UPLOAD   (set after climbing to {upload_alt}m)")
+    print()
+    print(f"  Cruise altitude : {alt}m AGL")
+    print(f"  Upload altitude : {upload_alt}m AGL")
+    print(f"  Stab delay      : {stab_sec}s after landing")
+    print(f"  Soak time       : {soak_sec}s on water")
+    print()
+    print("  Winch timing set via Mission Planner SCR_USER params:")
+    print("    SCR_USER1 = RELEASE_SEC  (descent time, default 20s)")
+    print("    SCR_USER2 = PAUSE_SEC    (soak at bottom,  default 2s)")
+    print("    SCR_USER3 = RETRACT_SEC  (retract time,  default 35s)")
+    print(f"  WARNING: soak_sec ({soak_sec}s) must be >= SCR_USER1+USER2+USER3")
+    print()
+    print("  *** VERIFY ALL VALUES IN MISSION PLANNER BEFORE UPLOAD ***")
+    print("=" * 62)
+
+    rows = []
+    seq  = 0
+
+    # HOME (seq 0)
+    rows.append(_wprow(seq, 1, 0, _CMD_WAYPOINT,
+                       lat=home[0], lon=home[1], alt=home[2]))
+    seq += 1
+
+    for lat, lon in coords:
+        # 1. NAV_TAKEOFF to cruise altitude
+        rows.append(_wprow(seq, 0, _FRAME_REL, _CMD_TAKEOFF,
+                           p1=0, lat=home[0], lon=home[1], alt=alt))
+        seq += 1
+
+        # 2. DO_SET_SERVO neutral at takeoff (safety)
+        rows.append(_wprow(seq, 0, _FRAME_MISSION, _CMD_DO_SERVO,
+                           p1=_SERVO_CH, p2=_SERVO_NEUTRAL))
+        seq += 1
+
+        # 3. NAV_WAYPOINT — fly to pond at cruise altitude
+        rows.append(_wprow(seq, 0, _FRAME_REL, _CMD_WAYPOINT,
+                           lat=lat, lon=lon, alt=alt))
+        seq += 1
+
+        # 4. NAV_LAND — descend and land on water
+        #    FC gates here until touchdown confirmed by EXTENDED_SYS_STATE
+        rows.append(_wprow(seq, 0, _FRAME_REL, _CMD_LAND,
+                           lat=lat, lon=lon, alt=0))
+        seq += 1
+
+        # 5. NAV_DELAY — stabilization after landing
+        rows.append(_wprow(seq, 0, _FRAME_MISSION, _CMD_DELAY,
+                           p1=stab_sec))
+        seq += 1
+
+        # 6. DO_SET_SERVO — trigger winch DEPLOY
+        rows.append(_wprow(seq, 0, _FRAME_MISSION, _CMD_DO_SERVO,
+                           p1=_SERVO_CH, p2=_SERVO_DEPLOY))
+        seq += 1
+
+        # 7. NAV_DELAY — soak time (covers full winch cycle)
+        #    Tune via SCR_USER1/2/3 in Mission Planner
+        rows.append(_wprow(seq, 0, _FRAME_MISSION, _CMD_DELAY,
+                           p1=soak_sec))
+        seq += 1
+
+        # 8. NAV_TAKEOFF — climb back to cruise altitude
+        rows.append(_wprow(seq, 0, _FRAME_REL, _CMD_TAKEOFF,
+                           p1=0, lat=lat, lon=lon, alt=alt))
+        seq += 1
+
+        # 9. CONDITION_CHANGE_ALT — wait until upload_alt reached
+        #    Safe to use here: runs concurrently with NAV_TAKEOFF (active NAV cmd)
+        rows.append(_wprow(seq, 0, _FRAME_REL, _CMD_COND_ALT,
+                           p1=upload_alt, alt=upload_alt))
+        seq += 1
+
+        # 10. DO_SET_SERVO — trigger data UPLOAD at altitude
+        rows.append(_wprow(seq, 0, _FRAME_MISSION, _CMD_DO_SERVO,
+                           p1=_SERVO_CH, p2=_SERVO_UPLOAD))
+        seq += 1
+
+    # RTL
+    rows.append(_wprow(seq, 0, _FRAME_MISSION, _CMD_RTL))
+    seq += 1
+
+    with open(output, 'w') as f:
+        f.write("QGC WPL 110\n")
+        for row in rows:
+            f.write(row + "\n")
+
+    print()
+    print(f"  Saved: {output}")
+    print(f"  Ponds: {len(coords)}  Items/pond: 10  Total items: {seq}")
+    print()
+
+
 def estimate_missionTime(hmodule, distances, wps, args):
     """
     Estimates the mission time for a given waypoint misison
@@ -241,17 +410,21 @@ def main(hmodule, args):
     if solution:
         indices, distances = print_solution(manager, routing, solution)
         sorted_coords = [data["coordinates"][i] for i in indices[:-1]]
-        generate_mission(args, coords=sorted_coords)
-        mission_times = estimate_missionTime(hmodule, distances, len(indices) - 1, args)
 
-        print(f"estimated mission time: {mission_times[0]//60:02d}:{mission_times[0]%60:02d} (mins:secs)")
-        print(f"           flight time: {mission_times[1]//60:02d}:{mission_times[1]%60:02d} (mins:secs)")
-        print(f"              takeoffs: {mission_times[2]//60:02d}:{mission_times[2]%60:02d} (mins:secs)")
-        print(f"              landings: {mission_times[3]//60:02d}:{mission_times[3]%60:02d} (mins:secs)")
-        
-        print(f"   max UAV flight time: {UAV_MAX_FTIME//60:02d}:{UAV_MAX_FTIME%60:02d} (mins:secs)")
-        if mission_times[1] >= UAV_MAX_FTIME:
-            print("ROUTE SIZE WARNING: UAV may end mission early with low battery")
+        if args.get('winch', False):
+            # NEW winch format: NAV_LAND + DO_SET_SERVO sequence
+            generate_mission_winch(args, coords=sorted_coords)
+        else:
+            # Original format: kept unchanged for backward compatibility
+            generate_mission(args, coords=sorted_coords)
+            mission_times = estimate_missionTime(hmodule, distances, len(indices) - 1, args)
+            print(f"estimated mission time: {mission_times[0]//60:02d}:{mission_times[0]%60:02d} (mins:secs)")
+            print(f"           flight time: {mission_times[1]//60:02d}:{mission_times[1]%60:02d} (mins:secs)")
+            print(f"              takeoffs: {mission_times[2]//60:02d}:{mission_times[2]%60:02d} (mins:secs)")
+            print(f"              landings: {mission_times[3]//60:02d}:{mission_times[3]%60:02d} (mins:secs)")
+            print(f"   max UAV flight time: {UAV_MAX_FTIME//60:02d}:{UAV_MAX_FTIME%60:02d} (mins:secs)")
+            if mission_times[1] >= UAV_MAX_FTIME:
+                print("ROUTE SIZE WARNING: UAV may end mission early with low battery")
 
         return sorted_coords
     else:
