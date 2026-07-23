@@ -182,12 +182,37 @@ class haucs(mp_module.MPModule):
         # montioring servo events
         self.locked_fix = None                         # (lat, lon) when edge detected
         self.gps_fix = {"lat": None, "lon": None}      # latest fix from GLOBAL_POSITION_INT
+
+        # --- debugging counters: shows in the MAVProxy console via idle_task() below ---
+        self._dbg_hb_count = 0
+        self._dbg_servo_msg_count = 0
+        self._dbg_servo_last_pwm = None
+        self._dbg_servo_last_t = None
+        self._dbg_servo_last_src = None
+        self._dbg_data96_seen = 0
+        self._dbg_data96_dropped = 0
+        self._dbg_data96_processed = 0
+        self._dbg_last_status_print = time.time()
+        self._dbg_status_period = 5.0  # seconds between status lines
+
         self.servo_mon = {
-            "chan": 9,          # <== set your winch/servo channel here (1..16)
-            "on_th": 1700,      # rising edge when pwm crosses >= on_th
-            "off_th": 1300,     # (hysteresis lower band)
+            # Must match TRIGGER_RC_CH in the Pi's main script (currently RC8). This was
+            # set to 9, which never matches the real trigger channel -- servo_mon["state"]
+            # never flips to 1, so DATA96 packets were being silently dropped at the gate
+            # in mavlink_packet(), and the GPS lock below never fired either.
+            "chan": 8,          # <== set your winch/servo channel here (1..16)
+            "on_th": 1800,      # rising edge when pwm crosses >= on_th (matches Pi's PWM_RELEASE)
+            "off_th": 1200,     # (hysteresis lower band, matches Pi's PWM_RETRACT)
             "state": 0          # 0=OFF, 1=ON (debounced)
         }
+        # How long (seconds) to keep accepting DATA96 after the falling edge.
+        # The Pi doesn't send the payload instantly at the falling edge -- it
+        # still has to BLE-FETCH from the sensor and transmit the frame, which
+        # can take several seconds. Without this grace window, real DATA96
+        # packets show up after servo_mon["state"] is already back to 0 and
+        # get silently dropped.
+        self._data96_grace_sec = 20.0
+        self._data96_armed_until = 0.0  # monotonic deadline; 0 = not armed
 
         ################################
         # initialize take/off land status
@@ -340,6 +365,35 @@ class haucs(mp_module.MPModule):
         # ensure hooks are attached early
         if self._hooks_attached == 0:
             self._try_attach_hooks()
+
+        # --- periodic debug status, so you can see in the MAVProxy console where the
+        # chain is (or isn't) working without waiting for an actual sampling event ---
+        if (time.time() - self._dbg_last_status_print) > self._dbg_status_period:
+            self._dbg_last_status_print = time.time()
+            servo_age = (
+                "%.1fs ago" % (time.time() - self._dbg_servo_last_t)
+                if self._dbg_servo_last_t else "never"
+            )
+#             self.console.writeln(
+#                 "[haucs][status] hooks=%d hb=%d | trigger(%s): count=%d last_pwm=%s (%s), chan=%d state=%s, mode=%s | "
+#                 "DATA96: seen=%d processed=%d dropped(armed=0)=%d | gps=(%s,%s)"
+#                 % (
+#                     self._hooks_attached,
+#                     self._dbg_hb_count,
+#                     self._dbg_servo_last_src or "none yet",
+#                     self._dbg_servo_msg_count,
+#                     self._dbg_servo_last_pwm,
+#                     servo_age,
+#                     self.servo_mon["chan"],
+#                     self.servo_mon["state"],
+#                     self.drone_variables.get("flight_mode", "unknown"),
+#                     self._dbg_data96_seen,
+#                     self._dbg_data96_processed,
+#                     self._dbg_data96_dropped,
+#                     self.drone_variables.get("lat"),
+#                     self.drone_variables.get("lon"),
+#                 )
+#             )
             
         # update firebase with drone status
         update_time = 1
@@ -398,6 +452,7 @@ class haucs(mp_module.MPModule):
                 self.drone_variables['time_remaining'] = m.time_remaining
                 
             elif m.get_type() == 'HEARTBEAT':
+                self._dbg_hb_count += 1
                 self.handle_heartbeat(m)
                 
             elif m.get_type() == 'STATUSTEXT':
@@ -442,43 +497,90 @@ class haucs(mp_module.MPModule):
                 elif evt == "TOUCHDOWN_FINAL":
                     self.console.writeln("Touchdown (FINAL)")
 
-            elif m.get_type() == 'SERVO_OUTPUT_RAW':
-                # Map channel to MAVLink port + index (8 channels per port)
-                ch = int(self.servo_mon["chan"])
-                port_needed = (ch - 1) // 8     # ch 1..8 -> 0, 9..16 -> 1
-                idx = (ch - 1) % 8 + 1          # 1..8
-                # Only process the message for the matching port
-                if getattr(m, "port", 0) != port_needed:
-                    return
-                pwm = getattr(m, f"servo{idx}_raw", None)
-                if pwm is None:
-                    return
-                prev = self.servo_mon["state"]
-                on_th, off_th = self.servo_mon["on_th"], self.servo_mon["off_th"]
+            elif m.get_type() == 'RC_CHANNELS':
+                # RC8 raw pilot input -- this is the trigger source in every flight mode
+                # EXCEPT AUTO, where SERVO_OUTPUT_RAW (below) is used instead. Mirrors
+                # the Pi's own mv_state["auto_mode"] source switching. Without this,
+                # servo_mon only ever watched SERVO_OUTPUT_RAW, which stays at 0 in
+                # manual flight unless that specific output channel is separately
+                # configured to pass RC8 through -- which is why testing in manual mode
+                # showed last_pwm=0 forever even while flipping the real switch.
+                if self.drone_variables.get("flight_mode") != "Auto":
+                    ch = int(self.servo_mon["chan"])
+                    pwm = getattr(m, f"chan{ch}_raw", None)
+                    if pwm is not None:
+                        self._handle_trigger_pwm(pwm, "RC_CHANNELS")
 
-                # Lock in lat/lng at the rising edge of servo
-                if prev == 0 and pwm >= on_th:
-                    self.servo_mon["state"] = 1
-                    # Lock the current lat/lon (if available)
-                    self.console.writeln("Serov Rising Edge (ready for sampling)")
-                    # locking GPS and pond id
-                    self.sampling_lat = self.drone_variables['lat']
-                    self.sampling_lng = self.drone_variables['lon']
-                    self.pond_data['pond_id']=self.get_pond_id()
-                    self.console.writeln(f"Locked GPS: {self.sampling_lat}, {self.sampling_lng} for pond: {self.pond_data['pond_id']}")
-                elif prev == 1 and pwm <= off_th: 
-                    # Update state (falling edge)
-                    self.servo_mon["state"] = 0
-                    
+            elif m.get_type() == 'SERVO_OUTPUT_RAW':
+                # Only authoritative in AUTO mode (mission DO_SET_SERVO commands show up
+                # here). Map channel to MAVLink port + index (8 channels per port).
+                if self.drone_variables.get("flight_mode") == "Auto":
+                    ch = int(self.servo_mon["chan"])
+                    port_needed = (ch - 1) // 8     # ch 1..8 -> 0, 9..16 -> 1
+                    idx = (ch - 1) % 8 + 1          # 1..8
+                    if getattr(m, "port", 0) != port_needed:
+                        return
+                    pwm = getattr(m, f"servo{idx}_raw", None)
+                    if pwm is not None:
+                        self._handle_trigger_pwm(pwm, "SERVO_OUTPUT_RAW")
+
             # handles data packets when the servo is engaged.
-            elif m.get_type() == "DATA96" and self.servo_mon["state"]==1:
-                self.proc_sensordata(m)
-                
+            elif m.get_type() == "DATA96":
+                self._dbg_data96_seen += 1
+                gate_open = (self.servo_mon["state"] == 1) or (time.time() < self._data96_armed_until)
+                if gate_open:
+                    self._dbg_data96_processed += 1
+                    self.proc_sensordata(m)
+                else:
+                    self._dbg_data96_dropped += 1
+                    # Log the first few and then only occasionally, so a burst of
+                    # dropped packets doesn't flood the console.
+                    if self._dbg_data96_dropped <= 5 or self._dbg_data96_dropped % 20 == 0:
+                        self.console.writeln(
+                            "[haucs] DATA96 received but DROPPED: gate closed "
+                            "(state=0, grace expired, chan=%d) -- total dropped=%d"
+                            % (self.servo_mon["chan"], self._dbg_data96_dropped)
+                        )
+
         except Exception as e:
                 err = traceback.format_exc(limit=1)  # 1 = just the last frame
                 self.console.writeln(f"[haucs] handler error: {err.strip()}")
                 # never let one bad packet kill the whole dispatcher
                 #self.console.writeln(f"[haucs] mavlink handler error: {type(e).__name__}: {e}")
+    def _handle_trigger_pwm(self, pwm, src):
+        '''Shared rising/falling-edge detection for the trigger channel, fed by
+        either RC_CHANNELS (manual modes) or SERVO_OUTPUT_RAW (AUTO mode) depending on
+        current flight mode -- see mavlink_packet() above.'''
+        self._dbg_servo_msg_count += 1
+        self._dbg_servo_last_pwm = pwm
+        self._dbg_servo_last_t = time.time()
+        self._dbg_servo_last_src = src
+
+        prev = self.servo_mon["state"]
+        on_th, off_th = self.servo_mon["on_th"], self.servo_mon["off_th"]
+
+        if prev == 0 and pwm >= on_th:
+            self.servo_mon["state"] = 1
+            mode = self.drone_variables.get("flight_mode", "unknown")
+            self.console.writeln(f"Servo Rising Edge (ready for sampling), src={src}, pwm={pwm}, flight_mode={mode}")
+            # .get() instead of [...]: drone_variables has no "lat"/"lon" key until the
+            # first GLOBAL_POSITION_INT arrives, so an edge before that would otherwise
+            # raise KeyError here and silently abort the GPS lock for this sample.
+            self.sampling_lat = self.drone_variables.get('lat')
+            self.sampling_lng = self.drone_variables.get('lon')
+            if self.sampling_lat is None or self.sampling_lng is None:
+                self.console.writeln("WARNING: no GPS fix yet -- sampling_lat/lng will be None for this drop")
+            self.pond_data['pond_id'] = self.get_pond_id()
+            self.console.writeln(f"Locked GPS: {self.sampling_lat}, {self.sampling_lng} for pond: {self.pond_data['pond_id']}")
+        elif prev == 1 and pwm <= off_th:
+            self.servo_mon["state"] = 0
+            self._data96_armed_until = time.time() + self._data96_grace_sec
+            mode = self.drone_variables.get("flight_mode", "unknown")
+            self.console.writeln(
+                f"Servo Falling Edge (sampling done), src={src}, pwm={pwm}, flight_mode={mode} "
+                f"-- DATA96 gate stays open for {self._data96_grace_sec:.0f}s more"
+            )
+
     def _reset_for_new_seq(self, new_seq):
         self._frame_seq = new_seq
         self._frame_done.clear()
@@ -501,7 +603,7 @@ class haucs(mp_module.MPModule):
 
             # End-of-frame control (Pi sends values=list(b"CONTROL"); we ignore content)
             if (var_id == self._var_id_frame_end) or (name == "frame_end"):
-                print(f"var_id:{var_id}, name:{name}")
+                self.console.writeln(f"[haucs] frame end received (var_id:{var_id}, name:{name}) -- committing upload")
                 self._commit_current(seq_id,"frame_end")
                 return
             # --- regular variables: accumulate into your existing buffers ---
@@ -527,8 +629,9 @@ class haucs(mp_module.MPModule):
             self.console.writeln(f"uploading data to firebase failed: {e}")
 
     def _commit_current(self, end_seq, reason):
-        print(f"end_seq:{end_seq}, self._last_uploaded_seq:{self._last_uploaded_seq}")
+        self.console.writeln(f"[haucs] commit_current: end_seq={end_seq}, last_uploaded_seq={self._last_uploaded_seq}, reason={reason}")
         if self._last_uploaded_seq == end_seq:
+            self.console.writeln(f"[haucs] skip upload: seq {end_seq} already uploaded")
             return
         else:
             # assemble payload
@@ -570,12 +673,15 @@ class haucs(mp_module.MPModule):
             try:
                 save_json(data, sensor_file)
                 db.reference(f"LH_Farm/pond_{pond_id}/{message_time}/").set(data)
-                print(f"db upload data: {data}")
+                self.console.writeln(
+                    "[haucs] DB UPLOAD OK -> LH_Farm/pond_%s/%s | seq=%s samples=%d lat=%s lng=%s"
+                    % (pond_id, message_time, seq, len(do_array), lat, lng)
+                )
                 self.pond_data['seq'] = self.pond_data.get('seq', 0) + 1
                 append_json('upload', 1, sensor_file)
             except Exception as e:
                 err = traceback.format_exc(limit=1)
-                self.console.writeln(f"[haucs] upload error: {err.strip()}")
+                self.console.writeln(f"[haucs] DB UPLOAD FAILED -> LH_Farm/pond_{pond_id}/{message_time}: {err.strip()}")
             finally:
                 # Finalize the frame regardless of success/failure
                 self._last_uploaded_seq = end_seq                 # ignore duplicate end markers for this seq

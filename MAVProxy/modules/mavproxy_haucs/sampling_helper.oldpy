@@ -60,23 +60,9 @@ def handle_extsys_with_final(landed_state, st):
     st['last'] = landed_state
     return evt
 
-SEND_ORDER = ["time", "DO", "temp", "pressure", "init_DO", "init_pressure", "batt_v"]
-VAR_MAP    = {"time": 0, "DO": 1, "temp": 2, "pressure": 3, "init_DO": 4, "init_pressure": 5, "batt_v": 6}
-
-SCALE = 32    # default scale; tradeoff between accuracy (higher) vs dynamic range (lower).
-
-# Per-variable scale factors. Pressure spans ~90 hPa which overflows int8 at SCALE=32
-# (max range = 127/32 = ~4 hPa from base). Use SCALE=1 for pressure vars (1 hPa resolution).
-# Must match SCALE_MAP in encoder_helper.py exactly.
-SCALE_MAP = {
-    0: 1,    # time          -- integer seconds, +-127s range from base
-    1: 32,   # DO
-    2: 32,   # temp
-    3: 1,    # pressure       — range up to ±127 hPa from base
-    4: 32,   # init_DO
-    5: 1,    # init_pressure  — same treatment
-    6: 32,   # batt_v
-}
+SEND_ORDER = ["time","do", "temp", "press"] 
+VAR_MAP = {"time": 0, "do": 1, "temp": 2, "press": 3}
+SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
 
 # -------------------- Msg Decoder --------------------
 def msg_decoder(buf):
@@ -84,11 +70,10 @@ def msg_decoder(buf):
     var_byte = buf[4]
     var_base = struct.unpack_from("!h", buf, 5)[0]
     varlen_raw = buf[7]
-    flags = 0              # encoder never sets flag bits; kept for caller compatibility
-    var_len = varlen_raw & 0xFF
+    flags = (varlen_raw >> 6) & 0x3
+    var_len = varlen_raw & 0x3F
     residues = list(struct.unpack_from("!" + "b"*var_len, buf, 8))
     is_resend = 1 if (var_byte & 0x80) else 0
     var_id = var_byte & 0x7F
-    scale = SCALE_MAP.get(var_id, SCALE)
-    values = [var_base + r / scale for r in residues]
+    values = [var_base + r / SCALE for r in residues]
     return seq_id, is_resend, var_id, var_len, values, flags
