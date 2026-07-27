@@ -660,6 +660,24 @@ class haucs(mp_module.MPModule):
             name = sensor_data_names.get(var_id)
             #print(f"seq_id:{seq_id}, var_id:{var_id}, var_len:{var_len}, values:{values}, name:{name}")
             if self._frame_seq is None:
+                # First packet after startup or after a committed frame
+                self._reset_for_new_seq(seq_id)
+            elif seq_id < self._frame_seq:
+                # Pi rebooted -- seq_id wrapped back to 0 (or near 0).
+                # Discard old buffer contents from previous session.
+                self.console.writeln(
+                    "[haucs] seq_id went backwards (%d -> %d) -- "
+                    "Pi likely rebooted, discarding old frame and resetting"
+                    % (self._frame_seq, seq_id))
+                self._reset_for_new_seq(seq_id)
+            elif seq_id > self._frame_seq + 1000:
+                # Large seq jump -- new deployment started before previous frame_end arrived.
+                # Commit whatever we have then start fresh.
+                self.console.writeln(
+                    "[haucs] large seq_id jump (%d -> %d) -- "
+                    "forcing commit of incomplete frame before starting new one"
+                    % (self._frame_seq, seq_id))
+                self._commit_current(self._frame_seq, "seq_jump")
                 self._reset_for_new_seq(seq_id)
             # --- special streams ---
             if name == "time":
