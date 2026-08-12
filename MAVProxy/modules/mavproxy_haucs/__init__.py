@@ -736,7 +736,16 @@ class haucs(mp_module.MPModule):
             init_pressure_list = vals.get('init_pressure', [])
             batt_v_list        = vals.get('batt_v', [])
 
-            init_DO       = init_DO_list[0] if init_DO_list else 0.0
+            init_DO_raw   = init_DO_list[0] if init_DO_list else 0.0
+            # 081226: the sensor already divides DO by its air calibration
+            # before it leaves the probe, so the "DO" array arriving here is
+            # a saturation ratio (0.91, 0.92, ...). "init_DO" is that same
+            # calibration expressed as a raw ADC count, in different units.
+            # Writing the count made the website divide the ratio a second
+            # time, collapsing every winch DO to near zero. firebase_worker.py
+            # solves this on the truck path with a hardcoded 1; do the same
+            # here so both record types mean the same thing downstream.
+            init_DO       = 1
             init_pressure = init_pressure_list[0] if init_pressure_list else 0.0
             batt_v        = batt_v_list[0] if batt_v_list else 0.0
 
@@ -751,6 +760,7 @@ class haucs(mp_module.MPModule):
                 'type': 'winch',
                 'do': do_array, 'temp': temp_array, 'pressure': pres_array,
                 'init_do': init_DO, 'init_pressure': init_pressure,
+                'init_do_raw': init_DO_raw,   # 081226: kept for drift / fouling checks
                 'batt_v': batt_v
             }
             try:
