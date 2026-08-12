@@ -63,20 +63,55 @@ def handle_extsys_with_final(landed_state, st):
 SEND_ORDER = ["time", "DO", "temp", "pressure", "init_DO", "init_pressure", "batt_v"]
 VAR_MAP    = {"time": 0, "DO": 1, "temp": 2, "pressure": 3, "init_DO": 4, "init_pressure": 5, "batt_v": 6}
 
-SCALE = 32    # default scale; tradeoff between accuracy (higher) vs dynamic range (lower).
+# ---- Residue coding, MUST match the other side exactly -------------------
+#
+# Each frame carries: var_base (int16) + N residues, where
+#     residue = round((value - var_base) * SCALE_MAP[var_id])
+# and var_base = round(mean of the chunk).
+#
+# Two things bound the scale:
+#   1. the residue must fit its integer width
+#   2. var_base is rounded to an integer, which alone costs up to 0.5
+#
+# Worst-case |value - var_base| measured over 8 real casts (BP2, Aug 2026):
+#     DO        0.41 ratio      temp   2.07 C
+#     pressure  64.1 hPa        batt   0.22 V
+# Scales below keep at least 2x margin on those figures.
+#
+# Pressure is the exception: 64 hPa of spread against an int8 limit of 127
+# caps it at scale 1, i.e. 1 hPa = 0.40 in of depth. That is adequate at a
+# fast ascent but becomes coarser than the sample spacing once the winch is
+# slowed to resolve near-bottom structure. It therefore uses int16 residues,
+# which costs one extra frame per cast and lifts the safe scale to ~255.
 
-# Per-variable scale factors. Pressure spans ~90 hPa which overflows int8 at SCALE=32
-# (max range = 127/32 = ~4 hPa from base). Use SCALE=1 for pressure vars (1 hPa resolution).
-# Must match SCALE_MAP in encoder_helper.py exactly.
+SCALE = 32          # fallback for any var_id not listed
+
 SCALE_MAP = {
-    0: 1,    # time          -- integer seconds, +-127s range from base
-    1: 32,   # DO
-    2: 32,   # temp
-    3: 1,    # pressure       — range up to ±127 hPa from base
-    4: 32,   # init_DO
-    5: 1,    # init_pressure  — same treatment
-    6: 32,   # batt_v
+    0: 1,      # time           sample index, integer
+    1: 100,    # DO             0.01 ratio, matches the sensor's own 2 dp
+    2: 32,     # temp           0.031 C; 64 would clip on observed 2.07 C spread
+    3: 100,    # pressure       0.01 hPa = 0.004 in   (int16, see WIDTH_MAP)
+    4: 32,     # init_DO        constant per cast, base captures it
+    5: 100,    # init_pressure  0.01 hPa; scale 1 was discarding the decimals
+    6: 100,    # batt_v         0.01 V
 }
+
+# Residue width in bytes. Anything not listed is 1 (int8).
+WIDTH_MAP = {
+    3: 2,      # pressure needs int16
+}
+
+def residue_width(var_id):
+    return WIDTH_MAP.get(int(var_id), 1)
+
+def residue_fmt(var_id):
+    return "h" if residue_width(var_id) == 2 else "b"
+
+def residue_limits(var_id):
+    return (-32768, 32767) if residue_width(var_id) == 2 else (-128, 127)
+
+def max_samples(var_id):
+    return (96 - 8) // residue_width(var_id)
 
 # -------------------- Msg Decoder --------------------
 def msg_decoder(buf):
@@ -86,9 +121,11 @@ def msg_decoder(buf):
     varlen_raw = buf[7]
     flags = 0              # encoder never sets flag bits; kept for caller compatibility
     var_len = varlen_raw & 0xFF
-    residues = list(struct.unpack_from("!" + "b"*var_len, buf, 8))
     is_resend = 1 if (var_byte & 0x80) else 0
     var_id = var_byte & 0x7F
+    # Residue width is per-variable; pressure is int16. Must match the encoder.
+    fmt = residue_fmt(var_id)
+    residues = list(struct.unpack_from("!" + fmt*var_len, buf, 8))
     scale = SCALE_MAP.get(var_id, SCALE)
     values = [var_base + r / scale for r in residues]
     return seq_id, is_resend, var_id, var_len, values, flags
