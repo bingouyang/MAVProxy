@@ -202,9 +202,29 @@ def _validate(cast):
 # ------------------------------------------------------------- presenting
 
 def utc_key(cast, utc_offset_hours):
-    """Firebase node name: YYYYMMDD_HH:MM:SS in UTC."""
+    """
+    Firebase node name: YYYYMMDD_HH:MM:SS in UTC.
+
+    The log records the Pi's LOCAL clock; Firebase keys are UTC. There is
+    deliberately no default offset. Passing None returns a LOCAL_ prefixed
+    string that is obviously not a Firebase key, and upload is refused, so
+    forgetting the offset can never quietly write a record at the wrong time.
+    """
+    if utc_offset_hours is None:
+        return "LOCAL_" + cast["local_time"].strftime("%Y%m%d_%H:%M:%S")
     return (cast["local_time"] +
             timedelta(hours=utc_offset_hours)).strftime("%Y%m%d_%H:%M:%S")
+
+
+def offset_banner(utc_offset_hours):
+    if utc_offset_hours is None:
+        return ("NO UTC OFFSET SET. The log is the Pi's local clock, Firebase "
+                "keys are UTC.\n"
+                "Keys below are LOCAL_ placeholders and upload is blocked.\n"
+                "Re-run with the offset, e.g. 4 if the Pi is on Eastern, "
+                "5 if Central.")
+    return ("Pi clock %+d h = UTC. Check this against a record you know is "
+            "good before uploading." % utc_offset_hours)
 
 
 def _rng(vals):
@@ -217,10 +237,10 @@ def summarize(casts, utc_offset_hours, out=print):
         out("no casts found")
         return
     out("")
-    out("Pi clock %+d h = UTC. Check this against a record you know is good "
-        "before uploading." % utc_offset_hours)
+    for ln in offset_banner(utc_offset_hours).split("\n"):
+        out(ln)
     out("")
-    out("  #  pi local time        firebase key (UTC)    n    lat        lon"
+    out("  #  pi local time        cast_id (UTC key)     n    lat        lon"
         "         flags")
     for i, c in enumerate(casts):
         lat = lon = None
@@ -277,6 +297,64 @@ def export_csv(cast, path):
                 row.append(col[i] if i < len(col) else "")
             wr.writerow(row)
     return path
+
+
+CSV_HEAD = ["cast_id", "cast_n", "pi_local", "utc_key",
+            "release_lat", "release_lon", "sample"]
+
+
+def cast_id(cast, utc_offset_hours):
+    """
+    Stable identifier for a cast: the Firebase node name it would be stored
+    under. Changes if you change the UTC offset, which is the point - the id
+    you filter on is the id it lands under.
+    """
+    return utc_key(cast, utc_offset_hours)
+
+
+def write_all_csv(casts, source_path, utc_offset_hours):
+    """
+    Write every extracted cast to ONE csv beside the input, with a cast_id
+    column so they can be told apart. Uploading stays per-cast and opt-in;
+    this is just so the data is on disk and inspectable.
+
+    Returns the path written, or None if there was nothing to write.
+    """
+    if not casts:
+        return None
+
+    base = os.path.abspath(source_path)
+    stem = os.path.basename(base)
+    if os.path.isdir(base):
+        out_dir, stem = base, os.path.basename(base.rstrip(os.sep))
+    else:
+        out_dir = os.path.dirname(base)
+        stem = os.path.splitext(stem)[0]
+    out_path = os.path.join(out_dir, stem + "_casts.csv")
+
+    present = []
+    for name in VAR_ORDER + ["lat", "lon"]:
+        if any(name in c["cols"] for c in casts) and name not in present:
+            present.append(name)
+
+    with open(out_path, "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(CSV_HEAD + present)
+        for idx, c in enumerate(casts):
+            cid = cast_id(c, utc_offset_hours)
+            rlat = rlon = ""
+            if c["releases"]:
+                _, rlat, rlon = c["releases"][0]
+            head = [cid, idx,
+                    c["local_time"].strftime("%Y-%m-%d %H:%M:%S"),
+                    utc_key(c, utc_offset_hours), rlat, rlon]
+            for i in range(c["n"]):
+                row = list(head) + [i]
+                for name in present:
+                    col = c["cols"].get(name, [])
+                    row.append(col[i] if i < len(col) else "")
+                wr.writerow(row)
+    return out_path
 
 
 # --------------------------------------------------------------- upload
@@ -368,7 +446,7 @@ def upload_record(record, key, confirmed, out=print):
 
 # --------------------------------------------- MAVProxy command interface
 
-_STATE = {"casts": [], "offset": 0, "path": None}
+_STATE = {"casts": [], "offset": None, "path": None}
 
 
 def cmd_parselog(module, args):
@@ -406,6 +484,10 @@ def cmd_parselog(module, args):
             out("wrote %s" % export_csv(cast, args[2]))
             return
 
+        if _STATE["offset"] is None:
+            out("refusing to upload: no UTC offset set. Re-run "
+                "'haucs parselog <file> <offset>' first.")
+            return
         pond = pond_for(cast, getattr(module, "pond_table", None))
         if pond is None:
             out("could not resolve pond from position; no pond table or no "
@@ -426,10 +508,13 @@ def cmd_parselog(module, args):
     if not os.path.exists(path):
         out("no such file: %s" % path)
         return
-    _STATE["offset"] = int(args[1]) if len(args) > 1 else 0
+    _STATE["offset"] = int(args[1]) if len(args) > 1 else None
     _STATE["path"] = path
     _STATE["casts"] = parse_source(path)
     summarize(_STATE["casts"], _STATE["offset"], out)
+    written = write_all_csv(_STATE["casts"], path, _STATE["offset"])
+    if written:
+        out("all %d casts written to %s" % (len(_STATE["casts"]), written))
 
 
 # ------------------------------------------------------------ standalone
@@ -446,8 +531,14 @@ def main(argv=None):
     def opt(name, default=None):
         return opts[opts.index(name) + 1] if name in opts else default
 
-    offset = int(opt("--utc-offset", "0"))
+    raw_off = opt("--utc-offset")
+    offset = int(raw_off) if raw_off is not None else None
     casts = parse_source(path)
+
+    # always keep everything extracted on disk, whatever the subcommand is
+    written = write_all_csv(casts, path, offset)
+    if written:
+        print("all %d casts written to %s" % (len(casts), written))
 
     if "--show" in opts:
         detail(casts[int(opt("--show"))], offset)
@@ -458,6 +549,10 @@ def main(argv=None):
         return 0
     if "--upload" in opts:
         cast = casts[int(opt("--upload"))]
+        if offset is None:
+            print("refusing to upload: pass --utc-offset. The log is local "
+                  "time, Firebase keys are UTC.")
+            return 1
         pond = opt("--pond")
         if pond is None:
             print("give --pond <id>; standalone mode has no pond table")
