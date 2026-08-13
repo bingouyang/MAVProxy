@@ -50,11 +50,19 @@ VAR_ORDER = ["time", "DO", "temp", "pressure",
              "init_DO", "init_pressure", "batt_v"]
 SAMPLE_VARS = ["DO", "temp", "pressure"]
 
+# Matches HaucsModule.drone_id in __init__.py, and every winch record already
+# in Firebase. bt_helper logs the BLE sensor name at DEBUG only, so an INFO
+# level log usually has no name to detect; this is the fallback that keeps a
+# recovered record identical to a live one.
+DEFAULT_SID = "SPLASHY_UNK"
+
 _TS = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})"
 RE_COLS = re.compile(_TS + r".*Uploading fetched BLE data: cols:(\{.*\})\s*$")
 RE_RELEASE = re.compile(_TS + r".*winch release.*lat=(-?[\d.]+) lon=(-?[\d.]+)")
 RE_DSIZE = re.compile(_TS + r".*finish sampling.*sample_size:\['dsize', '(\d+)'\]")
 RE_NOSAMP = re.compile(_TS + r".*BLE fetch returned no samples")
+# Only present if the Pi ran at DEBUG. Used when available.
+RE_SENSOR = re.compile(r"found sensor with UART service (\S+?)[,\s]")
 
 
 def _ts(datepart, msec):
@@ -80,9 +88,15 @@ def parse_log(path):
     casts = []
     releases = []
     pending_dsize = None
+    sid = None
 
     with open(path, "r", errors="ignore") as fh:
         for line in fh:
+            m = RE_SENSOR.search(line)
+            if m:
+                sid = m.group(1).strip()
+                continue
+
             m = RE_RELEASE.search(line)
             if m:
                 releases.append((_ts(m.group(1), m.group(2)),
@@ -118,6 +132,7 @@ def parse_log(path):
                 "releases": list(releases),
                 "dsize": pending_dsize,
                 "source": os.path.basename(path),
+                "sid": sid,
                 "warnings": [],
             }
             _validate(cast)
@@ -159,6 +174,7 @@ def parse_cache_csv(path):
         "releases": [(local, lat[0], lon[0])] if lat[0] is not None else [],
         "dsize": None,
         "source": base,
+        "sid": None,
         "warnings": [],
     }
     _validate(cast)
@@ -359,7 +375,8 @@ def write_all_csv(casts, source_path, utc_offset_hours):
 
 # --------------------------------------------------------------- upload
 
-def build_record(cast, drone_id, pond_id, seq=0, normalize_init_do=True):
+def build_record(cast, drone_id=None, pond_id=None, seq=0,
+                 normalize_init_do=True):
     """
     Build the record exactly as _commit_current does, so a recovered cast is
     indistinguishable from a live one.
@@ -383,10 +400,13 @@ def build_record(cast, drone_id, pond_id, seq=0, normalize_init_do=True):
     if cast["releases"]:
         _, lat, lon = cast["releases"][0]
 
+    # explicit argument wins, then a name detected in the log, then default
+    sid = drone_id or cast.get("sid") or DEFAULT_SID
+
     raw_init_do = first("init_DO")
     return {
         "seq": int(seq),
-        "sid": drone_id,
+        "sid": sid,
         "pid": str(pond_id),
         "lat": lat, "lng": lon,
         "type": "winch",
@@ -493,7 +513,7 @@ def cmd_parselog(module, args):
             out("could not resolve pond from position; no pond table or no "
                 "release event in the log")
             return
-        rec = build_record(cast, getattr(module, "drone_id", "unknown"), pond)
+        rec = build_record(cast, getattr(module, "drone_id", None), pond)
         key = utc_key(cast, _STATE["offset"])
         confirmed = len(args) > 2 and args[2] == "confirm"
         if cast["warnings"] and confirmed:
@@ -557,7 +577,7 @@ def main(argv=None):
         if pond is None:
             print("give --pond <id>; standalone mode has no pond table")
             return 1
-        rec = build_record(cast, opt("--sid", "unknown"), pond)
+        rec = build_record(cast, opt("--sid"), pond)
         if cast["warnings"]:
             print("warnings on this cast:")
             for w in cast["warnings"]:
