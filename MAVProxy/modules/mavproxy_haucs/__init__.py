@@ -44,10 +44,12 @@ sensor_data_names = {
 }
 
 # payload and header for encoding
-DATA_BYTES = 96
-HDR_LEN = 8   # seq_id 32bit(4)  varbyte (variable type uint8)  base (int16)  len (uint8)
-MAX_SAMPLES = (DATA_BYTES - HDR_LEN) // 1  # int8 residues
-SCALE = 32    # tradeoff between accuracy (higher) vs dynamic range (lower). 
+# 081326: these local copies shadowed the values imported from sampling_helper
+# and were already stale (HDR_LEN 8, flat SCALE 32 vs the encoder's SCALE_MAP).
+# They fed only the dead msg_decoder in the triple-quoted block below, but
+# leaving a wrong HDR_LEN next to a wire-format change is asking for trouble.
+# The live values come from sampling_helper: DATA_BYTES, HDR_LEN, SCALE,
+# SCALE_MAP, max_samples().
 # set or read the two high bits in var_len (payload[7])
 FLAG_NONE = 0
 FLAG_EOF  = 1  # end of frame
@@ -223,11 +225,19 @@ class haucs(mp_module.MPModule):
         # ----- per-frame aggregator (single-upload-per-frame) -----
         self._var_id_frame_end = 127   # must match Pi side
         self._last_uploaded_seq = None # idempotency guard
+        # 081326: chunks, not flat lists. A frame is placed by its chunk_idx so
+        # a lost DATA96 packet leaves an explicit gap instead of shifting every
+        # later sample. _sensor_chunks[name] = {chunk_idx: [values]}
+        self._sensor_chunks = {
+            "DO": {}, "temp": {}, "pressure": {},
+            "init_DO": {}, "init_pressure": {}, "batt_v": {}
+        }
         self._sensor_data_values = {
             "DO": [], "temp": [], "pressure": [],
             "init_DO": [], "init_pressure": [], "batt_v": []
         }
-        # keep time separately
+        # keep time separately, also chunk-keyed
+        self._time_chunks = {}
         self._time_buf = []
         self._frame_seq = None
         self._frame_done = set()
@@ -651,12 +661,15 @@ class haucs(mp_module.MPModule):
         self._frame_done.clear()
         for k in self._sensor_data_values:
             self._sensor_data_values[k] = []
+        for k in self._sensor_chunks:
+            self._sensor_chunks[k] = {}
+        self._time_chunks = {}
         self._time_buf = []
 
     def proc_sensordata(self, m):
         try:
             payload = bytes(m.data)[:m.len]
-            seq_id, is_resend, var_id, var_len, values, flags = msg_decoder(payload)
+            seq_id, is_resend, var_id, var_len, values, flags, chunk_idx = msg_decoder(payload)
             name = sensor_data_names.get(var_id)
             #print(f"seq_id:{seq_id}, var_id:{var_id}, var_len:{var_len}, values:{values}, name:{name}")
             if self._frame_seq is None:
@@ -681,7 +694,10 @@ class haucs(mp_module.MPModule):
                 self._reset_for_new_seq(seq_id)
             # --- special streams ---
             if name == "time":
-                self._time_buf = list(values) if values else []
+                # 081326: was self._time_buf = list(values), which discarded every
+                # frame but the last. Store by chunk like everything else.
+                if values:
+                    self._time_chunks[chunk_idx] = list(values)
                 return
 
             # End-of-frame control (Pi sends values=list(b"CONTROL"); we ignore content)
@@ -690,9 +706,11 @@ class haucs(mp_module.MPModule):
                 self._commit_current(seq_id,"frame_end")
                 return
             # --- regular variables: accumulate into your existing buffers ---
-            if name in self._sensor_data_values:
+            if name in self._sensor_chunks:
                 if values:
-                    self._sensor_data_values[name].extend(values)
+                    # 081326: place, do not extend. Arrival order is not sample order
+                    # once a frame is lost, and duplicates (resends) overwrite cleanly.
+                    self._sensor_chunks[name][chunk_idx] = list(values)
                 # optional: keep EOF tracking for debugging/logging only
                 if flags in (FLAG_EOF, FLAG_SOLO):
                     self._frame_done.add(name)
@@ -711,6 +729,29 @@ class haucs(mp_module.MPModule):
                 pass
             self.console.writeln(f"uploading data to firebase failed: {e}")
 
+    def _assemble(self, name, var_id):
+        """
+        081326: rebuild one variable from its received chunks, placing each at
+        its true sample offset. Missing frames become None, so index i always
+        means sample i across every variable. Returns (values, n_missing).
+        """
+        chunks = self._sensor_chunks.get(name, {}) if name != "time" else self._time_chunks
+        if not chunks:
+            return [], 0
+        width = max_samples(var_id)
+        last = max(chunks)
+        out, missing = [], 0
+        for c in range(last + 1):
+            block = chunks.get(c)
+            if block is None:
+                # a full frame never arrived; only the final chunk may be short,
+                # so a missing interior chunk is always exactly `width` samples
+                out.extend([None] * width)
+                missing += width
+            else:
+                out.extend(block)
+        return out, missing
+
     def _commit_current(self, end_seq, reason):
         self.console.writeln(f"[haucs] commit_current: end_seq={end_seq}, last_uploaded_seq={self._last_uploaded_seq}, reason={reason}")
         if self._last_uploaded_seq == end_seq:
@@ -727,27 +768,42 @@ class haucs(mp_module.MPModule):
             drone_id = self.drone_id
             pond_id  = self.pond_data.get('pond_id', 'wukn')
 
-            vals = self._sensor_data_values
-            do_array   = vals.get('DO', [])
-            temp_array = vals.get('temp', [])
-            pres_array = vals.get('pressure', [])
+            # 081326: assemble from chunks so every array is index-aligned.
+            do_array,   miss_do   = self._assemble('DO', VAR_MAP['DO'])
+            temp_array, miss_temp = self._assemble('temp', VAR_MAP['temp'])
+            pres_array, miss_pres = self._assemble('pressure', VAR_MAP['pressure'])
+            time_array, miss_time = self._assemble('time', VAR_MAP['time'])
 
-            init_DO_list       = vals.get('init_DO', [])
-            init_pressure_list = vals.get('init_pressure', [])
-            batt_v_list        = vals.get('batt_v', [])
+            init_DO_list, _       = self._assemble('init_DO', VAR_MAP['init_DO'])
+            init_pressure_list, _ = self._assemble('init_pressure', VAR_MAP['init_pressure'])
+            batt_v_list, _        = self._assemble('batt_v', VAR_MAP['batt_v'])
 
-            init_DO_raw   = init_DO_list[0] if init_DO_list else 0.0
-            # 081226: the sensor already divides DO by its air calibration
-            # before it leaves the probe, so the "DO" array arriving here is
-            # a saturation ratio (0.91, 0.92, ...). "init_DO" is that same
-            # calibration expressed as a raw ADC count, in different units.
-            # Writing the count made the website divide the ratio a second
-            # time, collapsing every winch DO to near zero. firebase_worker.py
-            # solves this on the truck path with a hardcoded 1; do the same
-            # here so both record types mean the same thing downstream.
-            init_DO       = 1
-            init_pressure = init_pressure_list[0] if init_pressure_list else 0.0
-            batt_v        = batt_v_list[0] if batt_v_list else 0.0
+            # keep the flat buffers populated for anything else reading them
+            self._sensor_data_values['DO']       = do_array
+            self._sensor_data_values['temp']     = temp_array
+            self._sensor_data_values['pressure'] = pres_array
+            self._time_buf = time_array
+
+            n_expect = max(len(do_array), len(temp_array), len(pres_array), len(time_array))
+            n_missing = miss_do + miss_temp + miss_pres + miss_time
+            complete  = (n_missing == 0 and
+                         len(do_array) == len(temp_array) == len(pres_array) == n_expect)
+            if not complete:
+                self.console.writeln(
+                    "[haucs] INCOMPLETE cast: %d of %d sample slots missing "
+                    "(do %d, temp %d, pressure %d, time %d). Uploading with nulls "
+                    "in the gaps and complete=False."
+                    % (n_missing, n_expect * 4, miss_do, miss_temp, miss_pres, miss_time))
+
+            # 081326: a lost first chunk would put None at index 0
+            def _first(lst, dflt=0.0):
+                for v in lst:
+                    if v is not None:
+                        return v
+                return dflt
+            init_DO       = _first(init_DO_list)
+            init_pressure = _first(init_pressure_list)
+            batt_v        = _first(batt_v_list)
 
             lat = getattr(self, "sampling_lat", None)
             lng = getattr(self, "sampling_lng", None)
@@ -760,8 +816,10 @@ class haucs(mp_module.MPModule):
                 'type': 'winch',
                 'do': do_array, 'temp': temp_array, 'pressure': pres_array,
                 'init_do': init_DO, 'init_pressure': init_pressure,
-                'init_do_raw': init_DO_raw,   # 081226: kept for drift / fouling checks
-                'batt_v': batt_v
+                'batt_v': batt_v,
+                # 081326: so a consumer can tell a whole cast from a gappy one
+                'complete': bool(complete),
+                'n_missing': int(n_missing),
             }
             try:
                 save_json(data, sensor_file)

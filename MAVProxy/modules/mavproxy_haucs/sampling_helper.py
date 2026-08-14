@@ -110,8 +110,13 @@ def residue_fmt(var_id):
 def residue_limits(var_id):
     return (-32768, 32767) if residue_width(var_id) == 2 else (-128, 127)
 
+# 081326: header carries chunk_idx now. HDR_LEN and the unpack format below
+# MUST match encoder_helper.py exactly - they are the wire contract.
+DATA_BYTES = 96
+HDR_LEN    = 9      # seq_id(4) varbyte(1) base(int16,2) len(1) chunk_idx(1)
+
 def max_samples(var_id):
-    return (96 - 8) // residue_width(var_id)
+    return (DATA_BYTES - HDR_LEN) // residue_width(var_id)
 
 # -------------------- Msg Decoder --------------------
 def msg_decoder(buf):
@@ -119,13 +124,15 @@ def msg_decoder(buf):
     var_byte = buf[4]
     var_base = struct.unpack_from("!h", buf, 5)[0]
     varlen_raw = buf[7]
+    chunk_idx = buf[8]     # 081326: which block of samples this frame holds
     flags = 0              # encoder never sets flag bits; kept for caller compatibility
     var_len = varlen_raw & 0xFF
     is_resend = 1 if (var_byte & 0x80) else 0
     var_id = var_byte & 0x7F
     # Residue width is per-variable; pressure is int16. Must match the encoder.
     fmt = residue_fmt(var_id)
-    residues = list(struct.unpack_from("!" + fmt*var_len, buf, 8))
+    residues = list(struct.unpack_from("!" + fmt*var_len, buf, HDR_LEN))
     scale = SCALE_MAP.get(var_id, SCALE)
     values = [var_base + r / scale for r in residues]
-    return seq_id, is_resend, var_id, var_len, values, flags
+    # 081326: chunk_idx appended LAST so existing 6-tuple unpacking still works.
+    return seq_id, is_resend, var_id, var_len, values, flags, chunk_idx
