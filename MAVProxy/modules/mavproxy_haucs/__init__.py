@@ -272,7 +272,7 @@ class haucs(mp_module.MPModule):
 
     def usage(self):
         '''show help on command line options'''
-        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id\n\twinch release | fetch | clear"
 
     def _masters(self):
         mm = getattr(self.mpstate, "mav_master", None)
@@ -300,6 +300,101 @@ class haucs(mp_module.MPModule):
         except Exception:
             err = traceback.format_exc(limit=3).strip().replace("\n", " | ")
             self.console.writeln(f"[haucs] mavlink_packet error: {err}")
+
+    # ---- 081426: trigger the winch without an RC transmitter -------------
+    #
+    # The Pi decides what to do from trigger channel 8, and which message it
+    # watches depends on flight mode (main_rc8_uart_parm.py):
+    #   AUTO      -> SERVO_OUTPUT_RAW.servo8_raw, driven by mission DO_SET_SERVO
+    #   any other -> RC_CHANNELS.chan8_raw, driven by the manual radio
+    # Thresholds are PWM_RELEASE 1800 and PWM_RETRACT 1200.
+    #
+    # So the trigger has to match the mode. In AUTO we issue DO_SET_SERVO,
+    # matching what the mission itself does. Otherwise we send an RC override
+    # on channel 8, which is what the radio would have produced.
+    TRIGGER_CH   = 8
+    PWM_HIGH     = 1975
+    PWM_LOW      = 1025
+
+    def _winch_trigger(self, pwm, what):
+        mode = self.drone_variables.get('flight_mode', 'unknown')
+        auto = (str(mode).lower() == 'auto')
+
+        if auto:
+            # Mission-style servo command. Same path the waypoint sequence uses.
+            self.master.mav.command_long_send(
+                self.target_system, self.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_SERVO, 0,
+                self.TRIGGER_CH, pwm, 0, 0, 0, 0, 0)
+            how = "DO_SET_SERVO ch%d=%d" % (self.TRIGGER_CH, pwm)
+        else:
+            # RC override. Channels we are not driving are sent as 0, which
+            # RELEASES any override on them rather than pinning them - never
+            # send a fixed value to a channel you do not intend to control.
+            chans = [0] * 8
+            chans[self.TRIGGER_CH - 1] = pwm
+            self.master.mav.rc_channels_override_send(
+                self.target_system, self.target_component, *chans)
+            how = "RC override ch%d=%d" % (self.TRIGGER_CH, pwm)
+
+        print("[haucs] %s: %s (mode %s)" % (what, how, mode))
+        self.gcs_status("%s via %s" % (what, "servo" if auto else "rc"),
+                        force=True)
+        if not auto:
+            print("[haucs] override stays until 'haucs winch clear' or the "
+                  "next trigger. The radio cannot move ch%d meanwhile."
+                  % self.TRIGGER_CH)
+
+    def _cycle_seconds(self):
+        """
+        081426: how long the Pi's winch cycle will take, from SCR_USER1/2/3.
+        Returns (release, pause, retract_cap, total) or None if the params
+        have not been fetched yet.
+        """
+        try:
+            rel = float(self.get_mav_param("SCR_USER1", 0) or 0)
+            pau = float(self.get_mav_param("SCR_USER2", 0) or 0)
+            ret = float(self.get_mav_param("SCR_USER3", 0) or 0)
+        except Exception:
+            return None
+        if rel <= 0 and pau <= 0 and ret <= 0:
+            return None
+        return rel, pau, ret, rel + pau + ret
+
+    def cmd_winch(self, args):
+        """haucs winch release | fetch | clear"""
+        if not args:
+            print("usage: haucs winch release | fetch | clear")
+            print("  release  ch8 HIGH. Starts the Pi's whole timed cycle:")
+            print("           release, bottom pause, then retract. The Pi runs")
+            print("           it on its own timers; nothing here drives it.")
+            print("  fetch    ch8 LOW. Only pulls samples off the sensor and")
+            print("           uploads. Does NOT retract. Send it after the")
+            print("           cycle above has finished, or you get a part cast.")
+            print("  clear    drop any RC override on ch8")
+            return
+
+        if args[0] == "release":
+            self._winch_trigger(self.PWM_HIGH, "winch RELEASE")
+            c = self._cycle_seconds()
+            if c:
+                print("[haucs] Pi cycle: release %.0fs + pause %.0fs + retract "
+                      "up to %.0fs = up to %.0fs. Wait for 'CAST COMPLETE' or "
+                      "at least that long before 'haucs winch fetch'."
+                      % c)
+            else:
+                print("[haucs] SCR_USER1/2/3 not read yet, so cycle length is "
+                      "unknown. Wait for the Pi's retract to finish before "
+                      "'haucs winch fetch'.")
+        elif args[0] == "fetch":
+            self._winch_trigger(self.PWM_LOW, "data FETCH and upload")
+        elif args[0] == "clear":
+            self.master.mav.rc_channels_override_send(
+                self.target_system, self.target_component, *([0] * 8))
+            print("[haucs] RC overrides released, radio has ch%d back"
+                  % self.TRIGGER_CH)
+        else:
+            print("usage: haucs winch release | fetch | clear")
 
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
@@ -338,6 +433,8 @@ class haucs(mp_module.MPModule):
 
                 print(f"STARTING {self.cal_target}sec DO CALIBRATION ...")
                 
+        elif args[0] == "winch":
+            self.cmd_winch(args[1:])
         elif args[0] == "set_id":
             if len(args) != 2:
                 print("set drone id\nexample: haucs set_id SPLASHY_1")
