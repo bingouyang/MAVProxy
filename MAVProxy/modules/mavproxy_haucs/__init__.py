@@ -675,6 +675,9 @@ class haucs(mp_module.MPModule):
             if self._frame_seq is None:
                 # First packet after startup or after a committed frame
                 self._reset_for_new_seq(seq_id)
+                # 081426: tell the operator the ground station started hearing
+                # DATA96 for a new cast.
+                self.gcs_status("RX cast started (seq %d)" % seq_id, force=True)
             elif seq_id < self._frame_seq:
                 # Pi rebooted -- seq_id wrapped back to 0 (or near 0).
                 # Discard old buffer contents from previous session.
@@ -752,6 +755,58 @@ class haucs(mp_module.MPModule):
                 out.extend(block)
         return out, missing
 
+    def gcs_status(self, text, force=False):
+        """
+        081426: push a short INFO STATUSTEXT to every connected GCS output.
+
+        self.master.mav sends to the VEHICLE, which is not what we want.
+        Mission Planner sits on mpstate.mav_outputs (the --out links), so
+        write there. Also mirrored to the MAVProxy console so the message is
+        not lost when no output link is configured.
+
+        Severity INFO (6) is below every mission-critical severity (0-4), so
+        these can never displace a real warning.
+        """
+        self.console.writeln("[haucs] " + text)
+        now = time.time()
+        if not force and (now - getattr(self, "_status_last", 0.0)) < 1.0:
+            return
+        self._status_last = now
+        payload = ("HAUCS-GCS: " + text)[:49].encode("ascii", "replace")
+        outs = getattr(self.mpstate, "mav_outputs", [])
+        if not outs:
+            # Nothing is listening. Mission Planner attaches to a MAVProxy
+            # --out link; without one these messages exist only in the
+            # MAVProxy console, which is easy to miss.
+            if not getattr(self, "_warned_no_out", False):
+                self._warned_no_out = True
+                self.console.writeln(
+                    "[haucs] no --out link, so GCS status will not reach "
+                    "Mission Planner (console only)")
+            return
+        try:
+            for out in outs:
+                # 081426: stamp as the vehicle, not as sysid 255. Mission
+                # Planner shows STATUSTEXT for the vehicle it is tracking, so
+                # a message from the default GCS sysid can land outside the
+                # pane the operator is watching. Forwarding uses raw
+                # r.write(msgbuf) and never touches out.mav, so changing this
+                # affects only the messages generated here. Saved and
+                # restored anyway.
+                old_sys = out.mav.srcSystem
+                old_comp = out.mav.srcComponent
+                try:
+                    out.mav.srcSystem = self.target_system or 1
+                    out.mav.srcComponent = \
+                        mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
+                    out.mav.statustext_send(
+                        mavutil.mavlink.MAV_SEVERITY_INFO, payload)
+                finally:
+                    out.mav.srcSystem = old_sys
+                    out.mav.srcComponent = old_comp
+        except Exception as e:
+            self.console.writeln("[haucs] statustext to GCS failed: %s" % e)
+
     def _commit_current(self, end_seq, reason):
         self.console.writeln(f"[haucs] commit_current: end_seq={end_seq}, last_uploaded_seq={self._last_uploaded_seq}, reason={reason}")
         if self._last_uploaded_seq == end_seq:
@@ -828,11 +883,19 @@ class haucs(mp_module.MPModule):
                     "[haucs] DB UPLOAD OK -> LH_Farm/pond_%s/%s | seq=%s samples=%d lat=%s lng=%s"
                     % (pond_id, message_time, seq, len(do_array), lat, lng)
                 )
+                # 081426: the confirmation the operator is waiting for.
+                self.gcs_status(
+                    "DB OK %s %s %ds%s" % (pond_id, message_time[-8:],
+                                           len(do_array),
+                                           "" if complete else " GAPS"),
+                    force=True)
                 self.pond_data['seq'] = self.pond_data.get('seq', 0) + 1
                 append_json('upload', 1, sensor_file)
             except Exception as e:
                 err = traceback.format_exc(limit=1)
                 self.console.writeln(f"[haucs] DB UPLOAD FAILED -> LH_Farm/pond_{pond_id}/{message_time}: {err.strip()}")
+                self.gcs_status("DB UPLOAD FAILED pond %s" % pond_id,
+                                force=True)
             finally:
                 # Finalize the frame regardless of success/failure
                 self._last_uploaded_seq = end_seq                 # ignore duplicate end markers for this seq
