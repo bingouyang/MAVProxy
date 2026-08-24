@@ -713,6 +713,13 @@ class haucs(mp_module.MPModule):
                             "(state=0, grace expired, chan=%d) -- total dropped=%d"
                             % (self.servo_mon["chan"], self._dbg_data96_dropped)
                         )
+                        # 082426: night operators cannot watch the MAVProxy
+                        # console. Data arriving and being discarded is the
+                        # failure worth seeing live, so raise it on the GCS.
+                        self.gcs_status(
+                            "DATA RX but GATED ch%d (x%d)"
+                            % (self.servo_mon["chan"], self._dbg_data96_dropped),
+                            force=True, sev=mavutil.mavlink.MAV_SEVERITY_WARNING)
 
         except Exception as e:
                 err = traceback.format_exc(limit=1)  # 1 = just the last frame
@@ -852,7 +859,7 @@ class haucs(mp_module.MPModule):
                 out.extend(block)
         return out, missing
 
-    def gcs_status(self, text, force=False):
+    def gcs_status(self, text, force=False, sev=None):
         """
         081426: push a short INFO STATUSTEXT to every connected GCS output.
 
@@ -897,7 +904,8 @@ class haucs(mp_module.MPModule):
                     out.mav.srcComponent = \
                         mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
                     out.mav.statustext_send(
-                        mavutil.mavlink.MAV_SEVERITY_INFO, payload)
+                        sev if sev is not None
+                        else mavutil.mavlink.MAV_SEVERITY_INFO, payload)
                 finally:
                     out.mav.srcSystem = old_sys
                     out.mav.srcComponent = old_comp
@@ -946,6 +954,11 @@ class haucs(mp_module.MPModule):
                     "(do %d, temp %d, pressure %d, time %d). Uploading with nulls "
                     "in the gaps and complete=False."
                     % (n_missing, n_expect * 4, miss_do, miss_temp, miss_pres, miss_time))
+                # 082426: the console line above is invisible to a night
+                # operator, and lost frames are worth knowing about at once.
+                self.gcs_status("CAST GAPS %d/%d slots missing"
+                                % (n_missing, n_expect * 4), force=True,
+                                sev=mavutil.mavlink.MAV_SEVERITY_WARNING)
 
             # 081326: a lost first chunk would put None at index 0
             def _first(lst, dflt=0.0):
@@ -992,7 +1005,8 @@ class haucs(mp_module.MPModule):
                 err = traceback.format_exc(limit=1)
                 self.console.writeln(f"[haucs] DB UPLOAD FAILED -> LH_Farm/pond_{pond_id}/{message_time}: {err.strip()}")
                 self.gcs_status("DB UPLOAD FAILED pond %s" % pond_id,
-                                force=True)
+                                force=True,  # 082426: red on the MP HUD
+                                sev=mavutil.mavlink.MAV_SEVERITY_WARNING)
             finally:
                 # Finalize the frame regardless of success/failure
                 self._last_uploaded_seq = end_seq                 # ignore duplicate end markers for this seq
