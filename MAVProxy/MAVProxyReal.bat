@@ -21,6 +21,6 @@ set MAVLINK20=1
 REM --- Launch MAVProxy on control PC ---
 REM Replace COM6 and baudrate with your telemetry radio values
 
-python .\MAVProxy\mavproxy.py --master=COM6,57600 --out=udp:127.0.0.1:14550 --aircraft=splashy --console --cmd "set moddebug 3"
+python .\MAVProxy\mavproxy.py --master=COM7,57600 --out=udp:127.0.0.1:14550 --aircraft=splashy --console --cmd "set moddebug 3"
 
 pause
