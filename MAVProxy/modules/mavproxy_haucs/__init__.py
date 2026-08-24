@@ -901,14 +901,13 @@ class haucs(mp_module.MPModule):
                 old_comp = out.mav.srcComponent
                 try:
                     out.mav.srcSystem = self.target_system or 1
-                    # 082426 TEST: stamp as the autopilot component. Mission
-                    # Planner renders only the selected component on the HUD,
-                    # and 191 is not it. Safe here because this writes straight
-                    # to the --out links and never crosses the FC, so the
-                    # ArduPilot loopback guard that blocks the Pi cannot apply.
-                    # Revert to MAV_COMP_ID_ONBOARD_COMPUTER if the HUD still
-                    # shows nothing.
-                    out.mav.srcComponent = 1
+                    # 082426: component 1 was tried so these would land on the
+                    # Mission Planner HUD. It does reach the HUD, but only as a
+                    # sub-100ms flash at every severity, so the HUD is not a
+                    # usable operator channel. Reverted to the honest identity;
+                    # the Messages tab is where operators read these.
+                    out.mav.srcComponent = \
+                        mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
                     out.mav.statustext_send(
                         sev if sev is not None
                         else mavutil.mavlink.MAV_SEVERITY_INFO, payload)
