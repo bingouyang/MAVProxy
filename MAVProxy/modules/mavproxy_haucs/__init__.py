@@ -338,8 +338,13 @@ class haucs(mp_module.MPModule):
             how = "RC override ch%d=%d" % (self.TRIGGER_CH, pwm)
 
         print("[haucs] %s: %s (mode %s)" % (what, how, mode))
+        # 082426: sev=4 is what gets this onto Mission Planner's high priority
+        # line at all - INFO never appears there. repeat=4 repaints it so the
+        # ~0.2s single paint becomes readable. This is also the easiest message
+        # to fire on demand ("haucs winch release"), so it doubles as the test
+        # case for the whole alert path.
         self.gcs_status("%s via %s" % (what, "servo" if auto else "rc"),
-                        force=True)
+                        force=True, sev=4, repeat=4)
         if not auto:
             print("[haucs] override stays until 'haucs winch clear' or the "
                   "next trigger. The radio cannot move ch%d meanwhile."
@@ -719,7 +724,8 @@ class haucs(mp_module.MPModule):
                         self.gcs_status(
                             "DATA RX but GATED ch%d (x%d)"
                             % (self.servo_mon["chan"], self._dbg_data96_dropped),
-                            force=True, sev=mavutil.mavlink.MAV_SEVERITY_WARNING)
+                            force=True, sev=mavutil.mavlink.MAV_SEVERITY_WARNING,
+                            repeat=4)   # 082426: repaint so it can be read
 
         except Exception as e:
                 err = traceback.format_exc(limit=1)  # 1 = just the last frame
@@ -859,23 +865,10 @@ class haucs(mp_module.MPModule):
                 out.extend(block)
         return out, missing
 
-    def gcs_status(self, text, force=False, sev=None):
-        """
-        081426: push a short INFO STATUSTEXT to every connected GCS output.
-
-        self.master.mav sends to the VEHICLE, which is not what we want.
-        Mission Planner sits on mpstate.mav_outputs (the --out links), so
-        write there. Also mirrored to the MAVProxy console so the message is
-        not lost when no output link is configured.
-
-        Severity INFO (6) is below every mission-critical severity (0-4), so
-        these can never displace a real warning.
-        """
-        self.console.writeln("[haucs] " + text)
-        now = time.time()
-        if not force and (now - getattr(self, "_status_last", 0.0)) < 1.0:
-            return
-        self._status_last = now
+    def _status_emit(self, text, sev):
+        """082426: the actual STATUSTEXT write, split out of gcs_status() so
+        the repeat worker can reuse it without re-running the console line or
+        the rate limiter."""
         payload = ("HAUCS-GCS: " + text)[:49].encode("ascii", "replace")
         outs = getattr(self.mpstate, "mav_outputs", [])
         if not outs:
@@ -916,6 +909,54 @@ class haucs(mp_module.MPModule):
                     out.mav.srcComponent = old_comp
         except Exception as e:
             self.console.writeln("[haucs] statustext to GCS failed: %s" % e)
+
+    def _status_repeat(self, text, sev, count, gap):
+        """082426: worker for gcs_status(repeat=N). Console line already
+        written by the caller, so emit to the links only."""
+        for i in range(count):
+            try:
+                self._status_emit("%s (%d)" % (text, count - i), sev)
+            except Exception as e:
+                self.console.writeln("[haucs] repeat status failed: %s" % e)
+                return
+            if i < count - 1:
+                time.sleep(gap)
+
+    def gcs_status(self, text, force=False, sev=None, repeat=1, gap=1.0):
+        """
+        081426: push a short INFO STATUSTEXT to every connected GCS output.
+
+        self.master.mav sends to the VEHICLE, which is not what we want.
+        Mission Planner sits on mpstate.mav_outputs (the --out links), so
+        write there. Also mirrored to the MAVProxy console so the message is
+        not lost when no output link is configured.
+
+        Severity INFO (6) is below every mission-critical severity (0-4), so
+        these can never displace a real warning.
+
+        082426: sev >= WARNING (4) reaches Mission Planner's high priority
+        line, but MP repaints it once and moves on - it does not hold it. The
+        reason ArduPilot's prearm text appears to persist is that the FC keeps
+        resending it. repeat=N does the same thing: N repaints, gap seconds
+        apart, so an alert is on screen long enough to be read. A counter
+        suffix is appended when repeating in case MP collapses identical
+        consecutive text. Sending happens on a daemon thread so the caller,
+        which may be inside packet handling, is never blocked.
+        """
+        self.console.writeln("[haucs] " + text)
+        now = time.time()
+        if not force and (now - getattr(self, "_status_last", 0.0)) < 1.0:
+            return
+        self._status_last = now
+
+        # 082426: repaint N times off-thread so the caller is not blocked.
+        if repeat > 1:
+            threading.Thread(
+                target=self._status_repeat,
+                args=(text, sev, int(repeat), float(gap)),
+                daemon=True).start()
+            return
+        self._status_emit(text, sev)
 
     def _commit_current(self, end_seq, reason):
         self.console.writeln(f"[haucs] commit_current: end_seq={end_seq}, last_uploaded_seq={self._last_uploaded_seq}, reason={reason}")
@@ -963,7 +1004,8 @@ class haucs(mp_module.MPModule):
                 # operator, and lost frames are worth knowing about at once.
                 self.gcs_status("CAST GAPS %d/%d slots missing"
                                 % (n_missing, n_expect * 4), force=True,
-                                sev=mavutil.mavlink.MAV_SEVERITY_WARNING)
+                                sev=mavutil.mavlink.MAV_SEVERITY_WARNING,
+                                repeat=4)   # 082426
 
             # 081326: a lost first chunk would put None at index 0
             def _first(lst, dflt=0.0):
@@ -1010,8 +1052,9 @@ class haucs(mp_module.MPModule):
                 err = traceback.format_exc(limit=1)
                 self.console.writeln(f"[haucs] DB UPLOAD FAILED -> LH_Farm/pond_{pond_id}/{message_time}: {err.strip()}")
                 self.gcs_status("DB UPLOAD FAILED pond %s" % pond_id,
-                                force=True,  # 082426: red on the MP HUD
-                                sev=mavutil.mavlink.MAV_SEVERITY_WARNING)
+                                force=True,
+                                sev=mavutil.mavlink.MAV_SEVERITY_WARNING,
+                                repeat=4)   # 082426
             finally:
                 # Finalize the frame regardless of success/failure
                 self._last_uploaded_seq = end_seq                 # ignore duplicate end markers for this seq
