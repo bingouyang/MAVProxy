@@ -188,6 +188,13 @@ class haucs(mp_module.MPModule):
             print("[haucs] file logging disabled: %s" % e)
         self._tee = _TeeConsole(self.mpstate.console, self._hlog)
         self._hlog.info("=== haucs module loaded, log at %s ===" % self._hlog_path)
+        # 083026: the decoding contract this GCS is running. Must match the
+        # line the Pi logs at startup; a mismatch decodes to plausible wrong
+        # numbers with no error on either side.
+        try:
+            self._hlog.info("wire contract: %s" % contract_id())
+        except Exception as e:
+            self._hlog.info("wire contract: unavailable (%s)" % e)
 
         self._hooked_ids = set()
         self._hooks_attached = 0
