@@ -17,6 +17,30 @@ import threading
 import pandas as pd
 import struct
 import traceback, time
+import logging          # 083026
+
+
+# 083026: GCS-side log file. The module had no file logging at all - every
+# console.writeln() went to the MAVProxy window and was lost when it closed,
+# so there was no record of pond resolution, DATA96 gating, or upload results
+# after a session. This tees every writeln to a file without touching any of
+# the ~30 call sites: the haucs class shadows MPModule's console property with
+# a wrapper that logs, then forwards to the real console.
+class _TeeConsole(object):
+    def __init__(self, real, log):
+        self._real = real
+        self._log = log
+
+    def writeln(self, text, *a, **kw):
+        try:
+            self._log.info(str(text))
+        except Exception:
+            pass                      # logging must never break the console
+        return self._real.writeln(text, *a, **kw)
+
+    def __getattr__(self, name):
+        # everything else (write, set_status, ...) passes straight through
+        return getattr(self._real, name)
 
 #### COMMAND PROMPTS ####
 # mavproxy.py --master=/dev/cu.usbserial-B001793K  --aircraft=splashy
@@ -138,9 +162,37 @@ class haucs(mp_module.MPModule):
     def __init__(self, mpstate):
         """Initialise module"""
         super(haucs, self).__init__(mpstate, "haucs", "")
+
+        # 083026: set this up first - the writeln below already goes through it.
+        # An explicit FileHandler rather than logging.basicConfig(): MAVProxy
+        # configures the root logger during startup, and basicConfig() is a
+        # silent no-op once the root logger has handlers. propagate=False keeps
+        # these lines out of MAVProxy's own log.
+        self._hlog = logging.getLogger("haucs")
+        self._hlog.setLevel(logging.INFO)
+        self._hlog.propagate = False
+        try:
+            # prefer MAVProxy's per-flight directory, so haucs.log sits next to
+            # flight.tlog and rotates with it
+            _logdir = getattr(getattr(mpstate, "status", None), "logdir", None)
+            if not _logdir:
+                _logdir = "logs"
+            os.makedirs(_logdir, exist_ok=True)
+            self._hlog_path = os.path.join(_logdir, "haucs.log")
+            if not self._hlog.handlers:
+                _h = logging.FileHandler(self._hlog_path, encoding="utf-8")
+                _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                self._hlog.addHandler(_h)
+        except Exception as e:
+            self._hlog_path = None
+            print("[haucs] file logging disabled: %s" % e)
+        self._tee = _TeeConsole(self.mpstate.console, self._hlog)
+        self._hlog.info("=== haucs module loaded, log at %s ===" % self._hlog_path)
+
         self._hooked_ids = set()
         self._hooks_attached = 0
         self.console.writeln("[haucs] loaded; will attach raw hooks as masters come up")
+        self.console.writeln("[haucs] log file: %s" % self._hlog_path)
         self.drone_id = "SPLASHY_UNK"        
         self.logged_in = False
         self.firebase_update = time.time()
@@ -248,6 +300,14 @@ class haucs(mp_module.MPModule):
             print("[haucs] lidar logger initialized")
         except Exception as e:
             print(f"[haucs] lidar logger init failed: {e}")
+
+    # 083026: shadows MPModule.console so every writeln in this module is also
+    # written to haucs.log. Falls back to the real console if __init__ has not
+    # reached the setup yet, so nothing can break at import time.
+    @property
+    def console(self):
+        tee = self.__dict__.get("_tee")
+        return tee if tee is not None else self.mpstate.console
 
     @property
     def wploader(self):
