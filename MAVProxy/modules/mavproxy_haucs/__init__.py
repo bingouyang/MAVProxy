@@ -57,6 +57,31 @@ LANDED_STATE = {0:'unknown',
 FLIGHT_MODE = {0:'Stabilize', 1:'Acro', 2:'AltHold', 3:'Auto', 4:'Guided', 5:'Loiter', 6:'RTL', 7:'Circle',
                9:'Land', 11:'Drift', 13:'Sport', 14:'Flip', 15:'AutoTune', 16:'PosHold', 17:'Brake'}
 
+# 083026: the Pi publishes a numeric status code as NAMED_VALUE_FLOAT "HAUCS",
+# and the winch rail as "WVOLT" / "WAMP" / "WPKA". The generic NAMED_VALUE_FLOAT
+# branch in mavlink_packet() already stores all four in drone_variables, so they
+# reach `haucs status` and Firebase with no change. What was missing is a record
+# of the SEQUENCE: the code is resent at 1 Hz and each one silently overwrites
+# the last, so haucs.log had no trace of which states a cast actually passed
+# through. _note_haucs_float() logs transitions only.
+HAUCS_CODES = {
+    0:  "idle",
+    1:  "release commanded",
+    2:  "payload descending",
+    3:  "sampling at depth",
+    4:  "retract running",
+    5:  "cast complete, transmitting",
+    8:  "LATCH/RELEASE FAILED",
+    9:  "RETRACT TIMEOUT",
+    10: "SENSOR FAULT",
+    11: "NO SAMPLES",
+    12: "OVERCURRENT / STALL",
+}
+
+# Must match INA_STALL_A in the Pi's wParms. Only used for the console warning
+# here; the Pi does its own detection and raises code 12.
+RAIL_STALL_A = 1.5
+
 sensor_data_names = {
     0: "time",
     1: "DO",
@@ -220,6 +245,11 @@ class haucs(mp_module.MPModule):
                                 "current":0,
                                 }
         self.on_water = False
+        # 083026: last HAUCS code seen, so only transitions are logged, and a
+        # latch on the overcurrent warning so it fires once per event rather
+        # than twice a second for as long as the winch is stalled.
+        self._haucs_last_code = None
+        self._rail_over = False
         self.pond_table = get_pond_table()
         self.pond_data = {"do":[],
                           "pressure":[],
@@ -677,6 +707,7 @@ class haucs(mp_module.MPModule):
             if m.get_type() == 'NAMED_VALUE_FLOAT':
                 self.timers[m.get_type()] = time.time()
                 self.drone_variables[m.name] = round(m.value,2)
+                self._note_haucs_float(m.name, m.value)      # 083026
                 
             elif m.get_type() == 'GLOBAL_POSITION_INT':
                 self.timers[m.get_type()] = time.time()
@@ -931,6 +962,40 @@ class haucs(mp_module.MPModule):
             else:
                 out.extend(block)
         return out, missing
+
+    def _note_haucs_float(self, name, value):
+        """083026: operator record for the Pi's HAUCS code and winch rail.
+
+        Storage is NOT done here - the caller already put the value in
+        drone_variables. This only writes the transitions to the console, and
+        therefore to haucs.log through the _TeeConsole. Never raises: a bad
+        packet must not break the NAMED_VALUE_FLOAT branch for p_DO/p_temp.
+        """
+        try:
+            # char[10] field; strip any padding before comparing.
+            nm = str(name).rstrip("\x00").strip()
+
+            if nm == "HAUCS":
+                code = int(round(value))
+                if code != self._haucs_last_code:
+                    self._haucs_last_code = code
+                    label = HAUCS_CODES.get(code, "unknown code")
+                    self.console.writeln("[haucs] %d  %s" % (code, label))
+
+            elif nm == "WAMP":
+                # Latched so a sustained stall logs once, not at 2 Hz.
+                volts = self.drone_variables.get("WVOLT", 0.0)
+                if value >= RAIL_STALL_A and not self._rail_over:
+                    self._rail_over = True
+                    self.console.writeln(
+                        "[haucs] WINCH OVERCURRENT %.2f A at %.2f V" % (value, volts))
+                elif value < RAIL_STALL_A and self._rail_over:
+                    self._rail_over = False
+                    self.console.writeln(
+                        "[haucs] winch current normal again, %.2f A at %.2f V"
+                        % (value, volts))
+        except Exception:
+            pass
 
     def _status_emit(self, text, sev):
         """082426: the actual STATUSTEXT write, split out of gcs_status() so
