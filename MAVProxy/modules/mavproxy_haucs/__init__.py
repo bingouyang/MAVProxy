@@ -369,7 +369,7 @@ class haucs(mp_module.MPModule):
 
     def usage(self):
         '''show help on command line options'''
-        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id\n\twinch release | fetch | clear"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id\n\twinch release | fetch | clear | codes"
 
     def _masters(self):
         mm = getattr(self.mpstate, "mav_master", None)
@@ -474,6 +474,7 @@ class haucs(mp_module.MPModule):
             print("           uploads. Does NOT retract. Send it after the")
             print("           cycle above has finished, or you get a part cast.")
             print("  clear    drop any RC override on ch8")
+            print("  codes    explain the HAUCS status codes")      # 083026
             return
 
         if args[0] == "release":
@@ -495,8 +496,10 @@ class haucs(mp_module.MPModule):
                 self.target_system, self.target_component, *([0] * 8))
             print("[haucs] RC overrides released, radio has ch%d back"
                   % self.TRIGGER_CH)
+        elif args[0] == "codes":                                     # 083026
+            self._print_codes()
         else:
-            print("usage: haucs winch release | fetch | clear")
+            print("usage: haucs winch release | fetch | clear | codes")
 
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
@@ -962,6 +965,43 @@ class haucs(mp_module.MPModule):
             else:
                 out.extend(block)
         return out, missing
+
+    def _print_codes(self):                                          # 083026
+        """Explain the HAUCS status code, the rail fields, and where each one
+        shows up. Bind these in Mission Planner's Quick window by double
+        clicking a cell -- note MP prefixes received named floats with MAV_,
+        so they sort under M, not under H or W."""
+        cur = self.drone_variables.get("HAUCS")
+        print("")
+        print("HAUCS winch status code   (Quick window field: MAV_HAUCS)")
+        print("  Under 8 is normal progress. 8 and above is a fault.")
+        print("")
+        for code in sorted(HAUCS_CODES):
+            mark = " <== now" if (cur is not None
+                                  and int(round(cur)) == code) else ""
+            note = "" if code in (0, 1, 5, 8, 9, 10, 11, 12) else "  (no text)"
+            print("   %2d  %-28s%s%s" % (code, HAUCS_CODES[code], note, mark))
+        if cur is None:
+            print("\n  no HAUCS code received yet this session")
+        print("")
+        print("  Codes 2, 3 and 4 send no Messages-tab wording: they occur on")
+        print("  every cast and would crowd the log. The number is the record.")
+        print("  Every fault code does send wording.")
+        print("")
+        print("Winch rail   (Quick window fields: MAV_WVOLT / MAV_WAMP / MAV_WPKA)")
+        for f, d in (("WVOLT", "rail volts, sags under load"),
+                     ("WAMP",  "current now, 2 Hz"),
+                     ("WPKA",  "peak amps since this cast began, not a rolling "
+                               "window")):
+            val = self.drone_variables.get(f)
+            print("   %-6s %-52s %s" % (f, d,
+                  ("= %.3f" % val) if val is not None else "(none yet)"))
+        print("")
+        print("  Polled at 20 Hz on the Pi and sent at 2 Hz, so WPKA catches")
+        print("  spikes shorter than the send interval. Overcurrent above %.1f A"
+              % RAIL_STALL_A)
+        print("  is logged here and raises code 12 on the Pi.")
+        print("")
 
     def _note_haucs_float(self, name, value):
         """083026: operator record for the Pi's HAUCS code and winch rail.
