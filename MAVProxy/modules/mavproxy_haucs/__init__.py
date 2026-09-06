@@ -78,6 +78,29 @@ HAUCS_CODES = {
     12: "OVERCURRENT / STALL",
 }
 
+# 083026: what each SCR_USER parameter does on the Pi. The Pi reads 1/2/3/5/6
+# once at startup in fetch_scr_user_params(), so a change here needs a Pi
+# restart to take effect -- that is the single most common surprise with these.
+# A value of 0 means "not set", and the Pi keeps its own wParms default.
+# SCR_USER4 is the odd one out: polled every 5 s, and acted on immediately.
+SCR_USER_DEFS = [
+    ("SCR_USER1", "RELEASE_SEC", "s",
+     "how long the servo drives out. Sets how deep the payload goes."),
+    ("SCR_USER2", "PAUSE_SEC", "s",
+     "idle at the bottom before retracting, so the sensor settles."),
+    ("SCR_USER3", "RETRACT_SEC", "s",
+     "retract time CAP, not a duration. Retract ends early when the Hall "
+     "sensor confirms home; this is the giving-up point."),
+    ("SCR_USER4", "shutdown flag", "",
+     "set to 1 to shut the Pi down cleanly. Polled every 5 s and reset to 0 "
+     "by the Pi. USE THIS before cutting power, to protect the SD card."),
+    ("SCR_USER5", "STEP_MOVE_SEC", "s",
+     "stepped ascent: seconds of movement per step. 0 = continuous retract."),
+    ("SCR_USER6", "STEP_HOLD_SEC", "s",
+     "stepped ascent: seconds held still between steps, letting the DO "
+     "sensor settle at each depth. Ignored when SCR_USER5 is 0."),
+]
+
 # Must match INA_STALL_A in the Pi's wParms. Only used for the console warning
 # here; the Pi does its own detection and raises code 12.
 RAIL_STALL_A = 1.5
@@ -369,7 +392,7 @@ class haucs(mp_module.MPModule):
 
     def usage(self):
         '''show help on command line options'''
-        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id\n\twinch release | fetch | clear | codes"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id\n\twinch release | fetch | clear | codes | params"
 
     def _masters(self):
         mm = getattr(self.mpstate, "mav_master", None)
@@ -473,8 +496,12 @@ class haucs(mp_module.MPModule):
             print("  fetch    ch8 LOW. Only pulls samples off the sensor and")
             print("           uploads. Does NOT retract. Send it after the")
             print("           cycle above has finished, or you get a part cast.")
-            print("  clear    drop any RC override on ch8")
+            print("  clear    drop any RC override on ch8, and acknowledge a")
+            print("           stuck HAUCS fault code (display only; the winch")
+            print("           is not touched and a live fault will re-raise)")
             print("  codes    explain the HAUCS status codes")      # 083026
+            print("  params   explain the SCR_USER parameters and show their")
+            print("           current values on the FC")             # 083026
             return
 
         if args[0] == "release":
@@ -496,10 +523,30 @@ class haucs(mp_module.MPModule):
                 self.target_system, self.target_component, *([0] * 8))
             print("[haucs] RC overrides released, radio has ch%d back"
                   % self.TRIGGER_CH)
+            # 083026: also acknowledge a stuck fault code. The Pi holds the
+            # last code and resends it at 1 Hz, so clearing the display here
+            # alone would be overwritten within a second - the Pi has to be
+            # told. HCLR resets its reported code to 0 and nothing else; it
+            # cannot move the winch, and a fault that is still occurring will
+            # re-raise its code on the next event.
+            code = self.drone_variables.get("HAUCS")
+            try:
+                self.master.mav.named_value_float_send(
+                    int(time.time() * 1000) & 0xFFFFFFFF, b"HCLR", 1.0)
+                if code is not None and int(round(code)) != 0:
+                    print("[haucs] acknowledged HAUCS code %d (%s)"
+                          % (int(round(code)),
+                             HAUCS_CODES.get(int(round(code)), "unknown")))
+                else:
+                    print("[haucs] HAUCS clear sent")
+            except Exception as e:
+                print("[haucs] could not send HAUCS clear: %s" % e)
         elif args[0] == "codes":                                     # 083026
             self._print_codes()
+        elif args[0] in ("params", "parms"):                         # 083026
+            self._print_params()
         else:
-            print("usage: haucs winch release | fetch | clear | codes")
+            print("usage: haucs winch release | fetch | clear | codes | params")
 
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
@@ -965,6 +1012,49 @@ class haucs(mp_module.MPModule):
             else:
                 out.extend(block)
         return out, missing
+
+    def _print_params(self):                                         # 083026
+        """Explain the SCR_USER parameters and show what the FC currently
+        holds. Values are read live; 'not set' means the Pi falls back to its
+        own wParms default for that one."""
+        print("")
+        print("SCR_USER parameters, set in Mission Planner's Full Parameter List")
+        print("")
+        for name, cfg_key, unit, desc in SCR_USER_DEFS:
+            try:
+                val = self.get_mav_param(name, None)
+            except Exception:
+                val = None
+            if val is None:
+                shown = "not read yet"
+            elif float(val) == 0 and name == "SCR_USER4":
+                # 0 here means "no shutdown requested", not "unset". Saying
+                # "Pi default applies" would be actively misleading.
+                shown = "0 (idle, no shutdown requested)"
+            elif float(val) == 0:
+                shown = "0 (not set, Pi default applies)"
+            else:
+                shown = ("%g %s" % (float(val), unit)).strip()
+            print("  %-10s %-15s %s" % (name, cfg_key, shown))
+            # wrap the description under the value, indented
+            words, line = desc.split(), "      "
+            for w in words:
+                if len(line) + len(w) + 1 > 74:
+                    print(line)
+                    line = "      "
+                line += w + " "
+            print(line.rstrip())
+            print("")
+        c = self._cycle_seconds()
+        if c:
+            print("  A cast therefore takes up to %.0fs "
+                  "(release %.0f + pause %.0f + retract cap %.0f)." % (c[3], c[0], c[1], c[2]))
+        else:
+            print("  Cycle length unknown: SCR_USER1/2/3 not read yet.")
+        print("")
+        print("  1, 2, 3, 5 and 6 are read ONCE when the Pi script starts.")
+        print("  Changing them needs a Pi restart. Only SCR_USER4 is live.")
+        print("")
 
     def _print_codes(self):                                          # 083026
         """Explain the HAUCS status code, the rail fields, and where each one
