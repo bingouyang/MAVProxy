@@ -353,6 +353,7 @@ class haucs(mp_module.MPModule):
         # against what the Pi built. Off by default because a cast is ~19
         # lines; turn on with "haucs winch trace on".
         self._trace_frames = False
+        self._dbg_dup_packets = 0       # 091726: suppressed double dispatches
         self._rx_frames = []            # (seq, var_id, name, chunk, nvals) in arrival order
         self._refetch_target = None     # set when a replay is expected
         self._data96_armed_until = 0.0  # monotonic deadline; 0 = not armed
@@ -584,6 +585,10 @@ class haucs(mp_module.MPModule):
                 self._trace_frames = not self._trace_frames
             print("[haucs] per-frame DATA96 trace %s"
                   % ("ON" if self._trace_frames else "OFF"))
+            print("[haucs] DATA96 seen=%d processed=%d gated=%d | "
+                  "duplicate dispatches suppressed=%d"                # 091726
+                  % (self._dbg_data96_seen, self._dbg_data96_processed,
+                     self._dbg_data96_dropped, self._dbg_dup_packets))
             if self._rx_frames:
                 print("[haucs] current cast so far: " + self._frame_report())
         elif args[0] == "refetch":                                   # 091726
@@ -822,6 +827,30 @@ class haucs(mp_module.MPModule):
 
     def mavlink_packet(self, m):
         '''handle mavlink packets'''
+        # 091726: DOUBLE DISPATCH. MPModule.mavlink_packet is called by MAVProxy
+        # for every message, and _raw_hook forwards the same message object here
+        # as well, so every packet was handled TWICE. The RX MAP showed it
+        # plainly: 32 frames recorded for the 17 the Pi sent, every chunk listed
+        # twice, and FRAME_END processed repeatedly -- which is where the pile of
+        # "skip upload: seq N already uploaded" lines came from.
+        #
+        # This affected every message type, not just DATA96: trigger edges on
+        # RC_CHANNELS, heartbeats and named floats were all processed twice.
+        #
+        # Both paths are kept, because the raw hook exists to catch messages
+        # MAVProxy does not route to modules on every link. Instead the message
+        # object itself is tagged -- it is the same object in both paths, since
+        # the hook fires during parsing and MAVProxy then dispatches that same
+        # instance -- so whichever arrives first does the work and the other
+        # returns immediately.
+        if getattr(m, "_haucs_seen", False):
+            self._dbg_dup_packets += 1
+            return
+        try:
+            m._haucs_seen = True
+        except Exception:
+            pass  # some message objects use __slots__; better twice than never
+
         try:
             #self.console.writeln(f"msg type: {m.get_type()}")
             if m.get_type() == 'NAMED_VALUE_FLOAT':
