@@ -1051,7 +1051,16 @@ class haucs(mp_module.MPModule):
                 self._reset_for_new_seq(seq_id)
                 # 081426: tell the operator the ground station started hearing
                 # DATA96 for a new cast.
-                self.gcs_status("RX cast started (seq %d)" % seq_id, force=True)
+                #
+                # 091726: but not when the first frame is a FRAME_END. The Pi
+                # sends FRAME_END three times (FRAME_END_RESEND) so that losing
+                # it cannot waste a whole cast. The first copy commits and sets
+                # _frame_seq back to None, so the redundant copies arrive here
+                # looking like the opening frame of a new cast and announced one
+                # that never happened -- four misleading lines per cast.
+                if var_id != self._var_id_frame_end:
+                    self.gcs_status("RX cast started (seq %d)" % seq_id,
+                                    force=True)
             elif seq_id < self._frame_seq:
                 # Pi rebooted -- seq_id wrapped back to 0 (or near 0).
                 # Discard old buffer contents from previous session.
