@@ -328,6 +328,13 @@ class haucs(mp_module.MPModule):
         # packets show up after servo_mon["state"] is already back to 0 and
         # get silently dropped.
         self._data96_grace_sec = 20.0
+        # 091726: a refetch is not preceded by a servo edge, so neither of the
+        # gate's two conditions holds and every replayed frame was dropped
+        # ("gate closed (state=0, grace expired)"). Requesting a replay must
+        # arm the gate explicitly. Its own window, because the replay is paced:
+        # 19 frames at SEND_GAP_S=0.075 is ~1.6 s today and ~5.6 s at 5x data,
+        # plus round-trip and the Pi reading its cache off the SD card.
+        self._refetch_grace_sec = 45.0
         self._data96_armed_until = 0.0  # monotonic deadline; 0 = not armed
 
         ################################
@@ -553,10 +560,22 @@ class haucs(mp_module.MPModule):
             # Ask the Pi to replay its newest cached cast. The Pi refuses if
             # the winch is mid-cycle, because the replay blocks the loop that
             # watches for RC edges.
+            # Arm the receive gate BEFORE asking, so no frame can arrive
+            # ahead of the window opening.
+            self._data96_armed_until = max(
+                self._data96_armed_until,
+                time.time() + self._refetch_grace_sec)
             if self._send_pi_float(b"HRFT", 1.0):
                 print("[haucs] refetch requested; the Pi will replay its "
                       "newest cached cast")
+                print("[haucs] DATA96 gate armed for %.0fs"
+                      % self._refetch_grace_sec)
                 print("[haucs] watch for code 6 (replaying) then 5 (complete)")
+                self.console.writeln("[haucs] refetch requested, gate armed %.0fs"
+                                     % self._refetch_grace_sec)
+            else:
+                # the request never went out; do not leave the gate open
+                self._data96_armed_until = 0.0
         else:
             print("usage: haucs winch release | fetch | clear | codes | "
                   "params | refetch")
@@ -1135,6 +1154,17 @@ class haucs(mp_module.MPModule):
                     self._haucs_last_code = code
                     label = HAUCS_CODES.get(code, "unknown code")
                     self.console.writeln("[haucs] %d  %s" % (code, label))
+                    # 091726: code 6 means the Pi is about to replay a cast.
+                    # Arming here as well as in the refetch command covers a
+                    # replay started any other way, and re-arms if the first
+                    # window has already run down.
+                    if code == 6:
+                        self._data96_armed_until = max(
+                            self._data96_armed_until,
+                            time.time() + self._refetch_grace_sec)
+                        self.console.writeln(
+                            "[haucs] replay inbound, DATA96 gate armed %.0fs"
+                            % self._refetch_grace_sec)
 
             elif nm == "WAMP":
                 # Latched so a sustained stall logs once, not at 2 Hz.
