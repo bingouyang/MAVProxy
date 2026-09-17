@@ -335,6 +335,14 @@ class haucs(mp_module.MPModule):
         # 19 frames at SEND_GAP_S=0.075 is ~1.6 s today and ~5.6 s at 5x data,
         # plus round-trip and the Pi reading its cache off the SD card.
         self._refetch_grace_sec = 45.0
+        # 091726: the record key is the GCS clock at commit time, so a replay
+        # ten minutes later lands on a NEW key and the pond ends up with two
+        # records for one physical cast. Remember the key of the last cast that
+        # committed with gaps; a replay then overwrites THAT record instead of
+        # creating another. Armed only by an explicit refetch, so an ordinary
+        # next cast can never overwrite an earlier one.
+        self._last_gap_key = None       # (pond_id, message_time) or None
+        self._refetch_target = None     # set when a replay is expected
         self._data96_armed_until = 0.0  # monotonic deadline; 0 = not armed
 
         ################################
@@ -565,6 +573,13 @@ class haucs(mp_module.MPModule):
             self._data96_armed_until = max(
                 self._data96_armed_until,
                 time.time() + self._refetch_grace_sec)
+            self._refetch_target = self._last_gap_key                # 091726
+            if self._last_gap_key:
+                print("[haucs] replay will OVERWRITE LH_Farm/pond_%s/%s"
+                      % self._last_gap_key)
+            else:
+                print("[haucs] no gapped record on record; the replay will "
+                      "upload as a new cast")
             if self._send_pi_float(b"HRFT", 1.0):
                 print("[haucs] refetch requested; the Pi will replay its "
                       "newest cached cast")
@@ -576,6 +591,7 @@ class haucs(mp_module.MPModule):
             else:
                 # the request never went out; do not leave the gate open
                 self._data96_armed_until = 0.0
+                self._refetch_target = None                          # 091726
         else:
             print("usage: haucs winch release | fetch | clear | codes | "
                   "params | refetch")
@@ -1284,11 +1300,27 @@ class haucs(mp_module.MPModule):
             message_time_file = time.strftime('%Y%m%d_%H%M%S', time.gmtime(time.time()))
             message_time = time.strftime('%Y%m%d_%H:%M:%S', time.gmtime(time.time()))
 
+            # 091726: a requested replay is a correction to a specific record,
+            # not a new cast, so it reuses that record's key. _refetch_target
+            # is consumed here whatever the outcome, so a later ordinary cast
+            # cannot inherit it.
+            _overwrite = self._refetch_target
+            self._refetch_target = None
+            if _overwrite:
+                message_time = _overwrite[1]
+                self.console.writeln(
+                    "[haucs] replay: overwriting the gapped record at "
+                    "LH_Farm/pond_%s/%s" % _overwrite)
+
             os.makedirs(SENSORDIR, exist_ok=True)
             sensor_file = os.path.join(SENSORDIR, f'{message_time_file}.json')
             seq = self.pond_data.get('seq', 0)
             drone_id = self.drone_id
             pond_id  = self.pond_data.get('pond_id', 'wukn')
+            if _overwrite:
+                # the GPS lock may have moved on since; the record being
+                # corrected belongs to the pond it was filed under
+                pond_id = _overwrite[0]                              # 091726
 
             # 081326: assemble from chunks so every array is index-aligned.
             do_array,   miss_do   = self._assemble('DO', VAR_MAP['DO'])
@@ -1370,6 +1402,14 @@ class haucs(mp_module.MPModule):
                     force=True)
                 self.pond_data['seq'] = self.pond_data.get('seq', 0) + 1
                 append_json('upload', 1, sensor_file)
+                # 091726: track what a refetch would need to fix. A complete
+                # upload clears it; a gapped one becomes the new target. If a
+                # replay still arrives gapped the key stays set, so another
+                # refetch can try the same record again.
+                if complete:
+                    self._last_gap_key = None
+                else:
+                    self._last_gap_key = (pond_id, message_time)
             except Exception as e:
                 err = traceback.format_exc(limit=1)
                 self.console.writeln(f"[haucs] DB UPLOAD FAILED -> LH_Farm/pond_{pond_id}/{message_time}: {err.strip()}")
