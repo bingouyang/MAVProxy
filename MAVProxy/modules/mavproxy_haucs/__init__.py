@@ -1036,8 +1036,8 @@ class haucs(mp_module.MPModule):
             # never appears here was lost in transit; one that appears here but
             # is missing from the assembled arrays was dropped by our own logic,
             # and those two causes need completely different fixes.
-            self._rx_frames.append((seq_id, var_id, name, chunk_idx,
-                                    len(values) if values else 0))
+            _rx_rec = (seq_id, var_id, name, chunk_idx,
+                       len(values) if values else 0)
             if self._trace_frames:
                 self.console.writeln(
                     "[haucs] RX frame seq=%s var=%s(%s) chunk=%s n=%s len_hdr=%s "
@@ -1069,6 +1069,13 @@ class haucs(mp_module.MPModule):
                     % (self._frame_seq, seq_id))
                 self._commit_current(self._frame_seq, "seq_jump")
                 self._reset_for_new_seq(seq_id)
+            # 091726: appended here, AFTER the reset branches. Appending before
+            # them meant _reset_for_new_seq() cleared the very frame that
+            # triggered the reset, so a cast's first frame (time c0) was always
+            # absent from the RX MAP and looked like a loss that had not
+            # happened.
+            self._rx_frames.append(_rx_rec)
+
             # --- special streams ---
             if name == "time":
                 # 081326: was self._time_buf = list(values), which discarded every
@@ -1388,6 +1395,32 @@ class haucs(mp_module.MPModule):
         # the only record of which frames actually reached us.
         if self._last_uploaded_seq != end_seq:
             self.console.writeln("[haucs] RX MAP: " + self._frame_report())
+            # 091726: link scorecard. Every variable, not just the four that
+            # feed n_missing, so a lost batt_v or init_* frame is visible --
+            # those are the frames that have actually been going missing.
+            try:
+                _tot = _got = 0
+                _abs = []
+                for _nm, _vid in (("time", 0), ("DO", 1), ("temp", 2),
+                                  ("pressure", 3), ("init_DO", 4),
+                                  ("init_pressure", 5), ("batt_v", 6)):
+                    _ch = (self._time_chunks if _nm == "time"
+                           else self._sensor_chunks.get(_nm, {})) or {}
+                    if not _ch:
+                        continue
+                    _hi = max(_ch)
+                    for _c in range(_hi + 1):
+                        _tot += 1
+                        if _ch.get(_c) is None:
+                            _abs.append("%s c%d" % (_nm, _c))
+                        else:
+                            _got += 1
+                self.console.writeln(
+                    "[haucs] LINK: %d/%d frames received%s"
+                    % (_got, _tot,
+                       "" if not _abs else "  MISSING: " + ", ".join(_abs)))
+            except Exception as _e:
+                self.console.writeln("[haucs] link scorecard failed: %s" % _e)
         if self._last_uploaded_seq == end_seq:
             self.console.writeln(f"[haucs] skip upload: seq {end_seq} already uploaded")
             return
@@ -1450,8 +1483,16 @@ class haucs(mp_module.MPModule):
                 # anything else means partial or mis-decoded frames.
                 try:
                     _gaps = []
+                    # 091726: init_DO, init_pressure and batt_v are listed too.
+                    # The n_missing accounting above only covers do/temp/
+                    # pressure/time, so a batt_v frame was lost and the cast
+                    # still reported clean. These three are constants per cast,
+                    # so a gap in them is harmless for the data -- but it is
+                    # direct evidence about the link, which is exactly what is
+                    # being measured.
                     for _nm, _vid in (("time", 0), ("DO", 1), ("temp", 2),
-                                      ("pressure", 3)):
+                                      ("pressure", 3), ("init_DO", 4),
+                                      ("init_pressure", 5), ("batt_v", 6)):
                         _ch = (self._time_chunks if _nm == "time"
                                else self._sensor_chunks.get(_nm, {})) or {}
                         if not _ch:
