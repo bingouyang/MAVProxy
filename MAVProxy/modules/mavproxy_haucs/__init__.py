@@ -71,11 +71,13 @@ HAUCS_CODES = {
     3:  "sampling at depth",
     4:  "retract running",
     5:  "cast complete, transmitting",
+    6:  "replaying cached cast",           # 091726
     8:  "LATCH/RELEASE FAILED",
     9:  "RETRACT TIMEOUT",
     10: "SENSOR FAULT",
     11: "NO SAMPLES",
     12: "OVERCURRENT / STALL",
+    13: "DATA GAPS, GCS got an incomplete cast",   # 091726
 }
 
 # 083026: what each SCR_USER parameter does on the Pi. The Pi reads 1/2/3/5/6
@@ -392,7 +394,7 @@ class haucs(mp_module.MPModule):
 
     def usage(self):
         '''show help on command line options'''
-        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id\n\twinch release | fetch | clear | codes | params"
+        return "Usage: haucs <cmd>\n\tstatus\n\tsub\n\tlogin\n\tlogout\n\tdo_init\n\tgen_mission\n\tset_threshold\n\tset_id\n\twinch release | fetch | clear | codes | params | refetch"
 
     def _masters(self):
         mm = getattr(self.mpstate, "mav_master", None)
@@ -502,6 +504,8 @@ class haucs(mp_module.MPModule):
             print("  codes    explain the HAUCS status codes")      # 083026
             print("  params   explain the SCR_USER parameters and show their")
             print("           current values on the FC")             # 083026
+            print("  refetch  ask the Pi to replay its newest cached cast,")
+            print("           to fill gaps from lost DATA96 frames")  # 091726
             return
 
         if args[0] == "release":
@@ -545,8 +549,17 @@ class haucs(mp_module.MPModule):
             self._print_codes()
         elif args[0] in ("params", "parms"):                         # 083026
             self._print_params()
+        elif args[0] == "refetch":                                   # 091726
+            # Ask the Pi to replay its newest cached cast. The Pi refuses if
+            # the winch is mid-cycle, because the replay blocks the loop that
+            # watches for RC edges.
+            if self._send_pi_float(b"HRFT", 1.0):
+                print("[haucs] refetch requested; the Pi will replay its "
+                      "newest cached cast")
+                print("[haucs] watch for code 6 (replaying) then 5 (complete)")
         else:
-            print("usage: haucs winch release | fetch | clear | codes | params")
+            print("usage: haucs winch release | fetch | clear | codes | "
+                  "params | refetch")
 
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
@@ -1013,6 +1026,17 @@ class haucs(mp_module.MPModule):
                 out.extend(block)
         return out, missing
 
+    def _send_pi_float(self, name, value):                           # 091726
+        """Send one NAMED_VALUE_FLOAT to the Pi. Used for the small control
+        channel the Pi listens on: HCLR, HGAP, HRFT. Never raises."""
+        try:
+            self.master.mav.named_value_float_send(
+                int(time.time() * 1000) & 0xFFFFFFFF, name, float(value))
+            return True
+        except Exception as e:
+            print("[haucs] could not send %s: %s" % (name.decode(), e))
+            return False
+
     def _print_params(self):                                         # 083026
         """Explain the SCR_USER parameters and show what the FC currently
         holds. Values are read live; 'not set' means the Pi falls back to its
@@ -1268,6 +1292,12 @@ class haucs(mp_module.MPModule):
                                 % (n_missing, n_expect * 4), force=True,
                                 sev=mavutil.mavlink.MAV_SEVERITY_WARNING,
                                 repeat=4)   # 082426
+                # 091726: only the GCS can know a cast arrived incomplete --
+                # the Pi's own cache is complete, since the gaps are transmission
+                # losses. Tell it, so the operator sees code 13 on the HUD
+                # rather than having to read this log, and knows a refetch is
+                # worth doing.
+                self._send_pi_float(b"HGAP", float(n_missing))
 
             # 081326: a lost first chunk would put None at index 0
             def _first(lst, dflt=0.0):
