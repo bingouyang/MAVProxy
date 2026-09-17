@@ -341,7 +341,19 @@ class haucs(mp_module.MPModule):
         # committed with gaps; a replay then overwrites THAT record instead of
         # creating another. Armed only by an explicit refetch, so an ordinary
         # next cast can never overwrite an earlier one.
-        self._last_gap_key = None       # (pond_id, message_time) or None
+        # (pond_id, message_time, lat, lng) or None. 091726: coordinates are
+        # carried too. lat/lon are not in VAR_MAP so DATA96 never sends them --
+        # the GCS takes them from the "Locked GPS" servo rising edge. A replay
+        # has no rising edge, so sampling_lat/lng are stale or zero by then and
+        # the corrected record was landing at 0,0. The record being fixed keeps
+        # the position it was filed with.
+        self._last_gap_key = None
+        # 091726: frame-level trace for the temp-chunk-0 loss. One line per
+        # DATA96 accepted, so the exact set that arrives can be compared
+        # against what the Pi built. Off by default because a cast is ~19
+        # lines; turn on with "haucs winch trace on".
+        self._trace_frames = False
+        self._rx_frames = []            # (seq, var_id, name, chunk, nvals) in arrival order
         self._refetch_target = None     # set when a replay is expected
         self._data96_armed_until = 0.0  # monotonic deadline; 0 = not armed
 
@@ -519,6 +531,7 @@ class haucs(mp_module.MPModule):
             print("  codes    explain the HAUCS status codes")      # 083026
             print("  params   explain the SCR_USER parameters and show their")
             print("           current values on the FC")             # 083026
+            print("  trace    toggle a per-frame DATA96 log line (debugging)")
             print("  refetch  ask the Pi to replay its newest cached cast,")
             print("           to fill gaps from lost DATA96 frames")  # 091726
             return
@@ -564,6 +577,15 @@ class haucs(mp_module.MPModule):
             self._print_codes()
         elif args[0] in ("params", "parms"):                         # 083026
             self._print_params()
+        elif args[0] == "trace":                                     # 091726
+            if len(args) > 1 and args[1] in ("on", "off"):
+                self._trace_frames = (args[1] == "on")
+            else:
+                self._trace_frames = not self._trace_frames
+            print("[haucs] per-frame DATA96 trace %s"
+                  % ("ON" if self._trace_frames else "OFF"))
+            if self._rx_frames:
+                print("[haucs] current cast so far: " + self._frame_report())
         elif args[0] == "refetch":                                   # 091726
             # Ask the Pi to replay its newest cached cast. The Pi refuses if
             # the winch is mid-cycle, because the replay blocks the loop that
@@ -575,8 +597,8 @@ class haucs(mp_module.MPModule):
                 time.time() + self._refetch_grace_sec)
             self._refetch_target = self._last_gap_key                # 091726
             if self._last_gap_key:
-                print("[haucs] replay will OVERWRITE LH_Farm/pond_%s/%s"
-                      % self._last_gap_key)
+                print("[haucs] replay will OVERWRITE LH_Farm/pond_%s/%s "
+                      "at lat=%s lng=%s" % self._last_gap_key)
             else:
                 print("[haucs] no gapped record on record; the replay will "
                       "upload as a new cast")
@@ -594,7 +616,7 @@ class haucs(mp_module.MPModule):
                 self._refetch_target = None                          # 091726
         else:
             print("usage: haucs winch release | fetch | clear | codes | "
-                  "params | refetch")
+                  "params | refetch | trace")
 
     def cmd_haucs(self, args):
         '''control behaviour of the module'''
@@ -963,6 +985,9 @@ class haucs(mp_module.MPModule):
             )
 
     def _reset_for_new_seq(self, new_seq):
+        # 091726: keep the trace for the cast being closed out of the next
+        # cast's report
+        self._rx_frames = []
         self._frame_seq = new_seq
         self._frame_done.clear()
         for k in self._sensor_data_values:
@@ -977,6 +1002,20 @@ class haucs(mp_module.MPModule):
             payload = bytes(m.data)[:m.len]
             seq_id, is_resend, var_id, var_len, values, flags, chunk_idx = msg_decoder(payload)
             name = sensor_data_names.get(var_id)
+            # 091726: record every frame that decodes, before any of the
+            # branching below can return early. A frame the Pi sent but that
+            # never appears here was lost in transit; one that appears here but
+            # is missing from the assembled arrays was dropped by our own logic,
+            # and those two causes need completely different fixes.
+            self._rx_frames.append((seq_id, var_id, name, chunk_idx,
+                                    len(values) if values else 0))
+            if self._trace_frames:
+                self.console.writeln(
+                    "[haucs] RX frame seq=%s var=%s(%s) chunk=%s n=%s len_hdr=%s "
+                    "flags=%s resend=%s payload=%dB"
+                    % (seq_id, var_id, name, chunk_idx,
+                       len(values) if values else 0, var_len, flags, is_resend,
+                       len(payload)))
             #print(f"seq_id:{seq_id}, var_id:{var_id}, var_len:{var_len}, values:{values}, name:{name}")
             if self._frame_seq is None:
                 # First packet after startup or after a committed frame
@@ -1290,8 +1329,36 @@ class haucs(mp_module.MPModule):
             return
         self._status_emit(text, sev)
 
+    def _frame_report(self):
+        """091726: what arrived, by variable and chunk, in arrival order.
+
+        This is the line that separates a transmission loss from a receiver
+        bug. The Pi builds a fixed set of frames per cast; if one is absent
+        here it never arrived, and if it is present here but still missing
+        from the assembled array then this module discarded it.
+        """
+        if not self._rx_frames:
+            return "no frames recorded"
+        seqs = [f[0] for f in self._rx_frames]
+        per = {}
+        for seq, vid, nm, ch, nv in self._rx_frames:
+            per.setdefault(nm if nm else "var%s" % vid, []).append((ch, nv, seq))
+        parts = []
+        for nm in sorted(per):
+            got = sorted(per[nm])
+            parts.append("%s[%s]" % (nm, " ".join(
+                "c%d:%d(s%d)" % (c, nv, sq) for c, nv, sq in got)))
+        out_of_order = sum(1 for i in range(1, len(seqs)) if seqs[i] < seqs[i - 1])
+        return ("%d frames, seq %d..%d, %d out-of-order arrivals | %s"
+                % (len(self._rx_frames), min(seqs), max(seqs), out_of_order,
+                   "  ".join(parts)))
+
     def _commit_current(self, end_seq, reason):
         self.console.writeln(f"[haucs] commit_current: end_seq={end_seq}, last_uploaded_seq={self._last_uploaded_seq}, reason={reason}")
+        # 091726: always logged, not just under trace -- one line, and it is
+        # the only record of which frames actually reached us.
+        if self._last_uploaded_seq != end_seq:
+            self.console.writeln("[haucs] RX MAP: " + self._frame_report())
         if self._last_uploaded_seq == end_seq:
             self.console.writeln(f"[haucs] skip upload: seq {end_seq} already uploaded")
             return
@@ -1310,7 +1377,7 @@ class haucs(mp_module.MPModule):
                 message_time = _overwrite[1]
                 self.console.writeln(
                     "[haucs] replay: overwriting the gapped record at "
-                    "LH_Farm/pond_%s/%s" % _overwrite)
+                    "LH_Farm/pond_%s/%s (lat=%s lng=%s)" % _overwrite)
 
             os.makedirs(SENSORDIR, exist_ok=True)
             sensor_file = os.path.join(SENSORDIR, f'{message_time_file}.json')
@@ -1348,6 +1415,28 @@ class haucs(mp_module.MPModule):
                     "(do %d, temp %d, pressure %d, time %d). Uploading with nulls "
                     "in the gaps and complete=False."
                     % (n_missing, n_expect * 4, miss_do, miss_temp, miss_pres, miss_time))
+                # 091726: which chunk indices are absent, per variable. A
+                # missing count is a multiple of the per-frame capacity when
+                # whole frames are lost (87 for int8 vars, 43 for pressure);
+                # anything else means partial or mis-decoded frames.
+                try:
+                    _gaps = []
+                    for _nm, _vid in (("time", 0), ("DO", 1), ("temp", 2),
+                                      ("pressure", 3)):
+                        _ch = (self._time_chunks if _nm == "time"
+                               else self._sensor_chunks.get(_nm, {})) or {}
+                        if not _ch:
+                            _gaps.append("%s:NONE" % _nm)
+                            continue
+                        _absent = [c for c in range(max(_ch) + 1)
+                                   if _ch.get(c) is None]
+                        _gaps.append("%s:%s of 0..%d"
+                                     % (_nm, _absent if _absent else "-",
+                                        max(_ch)))
+                    self.console.writeln("[haucs] MISSING CHUNKS: "
+                                         + "  ".join(_gaps))
+                except Exception as _e:
+                    self.console.writeln("[haucs] chunk report failed: %s" % _e)
                 # 082426: the console line above is invisible to a night
                 # operator, and lost frames are worth knowing about at once.
                 self.gcs_status("CAST GAPS %d/%d slots missing"
@@ -1373,6 +1462,14 @@ class haucs(mp_module.MPModule):
 
             lat = getattr(self, "sampling_lat", None)
             lng = getattr(self, "sampling_lng", None)
+            if _overwrite:
+                # 091726: a replay is not a new fix. Use the position the
+                # record was originally filed with, not whatever the drone
+                # happens to report now (often 0,0 while sitting on the bank).
+                lat, lng = _overwrite[2], _overwrite[3]
+                self.console.writeln(
+                    "[haucs] replay: reusing original position lat=%s lng=%s"
+                    % (lat, lng))
 
             data = {
                 'seq': int(seq),
@@ -1409,7 +1506,7 @@ class haucs(mp_module.MPModule):
                 if complete:
                     self._last_gap_key = None
                 else:
-                    self._last_gap_key = (pond_id, message_time)
+                    self._last_gap_key = (pond_id, message_time, lat, lng)
             except Exception as e:
                 err = traceback.format_exc(limit=1)
                 self.console.writeln(f"[haucs] DB UPLOAD FAILED -> LH_Farm/pond_{pond_id}/{message_time}: {err.strip()}")
