@@ -72,12 +72,14 @@ HAUCS_CODES = {
     4:  "retract running",
     5:  "cast complete, transmitting",
     6:  "replaying cached cast",           # 091726
+    7:  "retracted, awaiting data fetch",  # 091826
     8:  "LATCH/RELEASE FAILED",
     9:  "RETRACT TIMEOUT",
     10: "SENSOR FAULT",
     11: "NO SAMPLES",
     12: "OVERCURRENT / STALL",
     13: "DATA GAPS, GCS got an incomplete cast",   # 091726
+    14: "WINCH CONTROL LOST (pigpio/servo)",        # 092426
 }
 
 # 083026: what each SCR_USER parameter does on the Pi. The Pi reads 1/2/3/5/6
