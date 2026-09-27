@@ -83,6 +83,7 @@ HAUCS_CODES = {
     15: "BLE LINK DOWN, cast not fetched",          # 092726
     16: "PARTIAL CAST, samples lost on BLE",        # 092726
     17: "RELEASE DURING FETCH, cast corrupted",     # 092726
+    18: "PAYLOAD DID NOT DEPLOY (holder/line?)",    # 092726
 }
 
 # 092726: the Pi also publishes three BLE fields. These tables MUST match
@@ -1252,7 +1253,11 @@ class haucs(mp_module.MPModule):
         for code in sorted(HAUCS_CODES):
             mark = " <== now" if (cur is not None
                                   and int(round(cur)) == code) else ""
-            note = "" if code in (0, 1, 5, 8, 9, 10, 11, 12) else "  (no text)"
+            # 092726: was a whitelist of codes that DO send wording, so every
+            # code added since (13-18) was mislabelled "(no text)". Inverted to
+            # name the four silent ones, which is the short and stable list:
+            # they fire on every cast and wording would crowd the Messages tab.
+            note = "  (no text)" if code in (2, 3, 4, 7) else ""
             print("   %2d  %-28s%s%s" % (code, HAUCS_CODES[code], note, mark))
         if cur is None:
             print("\n  no HAUCS code received yet this session")
