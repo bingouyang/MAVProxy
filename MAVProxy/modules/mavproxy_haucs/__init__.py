@@ -80,6 +80,41 @@ HAUCS_CODES = {
     12: "OVERCURRENT / STALL",
     13: "DATA GAPS, GCS got an incomplete cast",   # 091726
     14: "WINCH CONTROL LOST (pigpio/servo)",        # 092426
+    15: "BLE LINK DOWN, cast not fetched",          # 092726
+    16: "PARTIAL CAST, samples lost on BLE",        # 092726
+    17: "RELEASE DURING FETCH, cast corrupted",     # 092726
+}
+
+# 092726: the Pi also publishes three BLE fields. These tables MUST match
+# BLE_STATE / BLE_FETCH_STATE in main_rc8_uart_*.py.
+#
+#   BLES  live link state. Changes constantly during a cast, so it answers
+#         "is the sensor talking to the Pi right now".
+#   BLEF  outcome of the LAST fetch, and it is sticky -- nothing overwrites it
+#         until the next fetch. This is the one to look at after a cast.
+#   BLEN  samples that fetch actually RECEIVED. BLEN below the sensor's own
+#         count is what code 16 reports, and the difference is the loss.
+BLE_STATES = {
+    0:  "init",
+    1:  "connected",
+    2:  "disconnected",
+    3:  "reconnecting (fetch held)",
+    4:  "downloading samples",
+    5:  "fetched",
+    6:  "fetch PARTIAL",
+    7:  "fetch empty",
+    8:  "fetch raised",
+    9:  "fetch skipped, link down",
+    10: "disconnected by request",
+}
+
+BLE_FETCH_STATES = {
+    0: "no fetch yet this session",
+    1: "complete cast",
+    2: "PARTIAL, samples lost",
+    3: "sensor had no samples",
+    4: "fetch raised",
+    5: "link down, not fetched",
 }
 
 # 083026: what each SCR_USER parameter does on the Pi. The Pi reads 1/2/3/5/6
@@ -277,6 +312,9 @@ class haucs(mp_module.MPModule):
         # than twice a second for as long as the winch is stalled.
         self._haucs_last_code = None
         self._rail_over = False
+        # 092726: last BLE link state / fetch outcome, same transition-only rule.
+        self._ble_last_link = None
+        self._ble_last_fetch = None
         self.pond_table = get_pond_table()
         self.pond_data = {"do":[],
                           "pressure":[],
@@ -1237,6 +1275,35 @@ class haucs(mp_module.MPModule):
               % RAIL_STALL_A)
         print("  is logged here and raises code 12 on the Pi.")
         print("")
+        # 092726
+        print("BLE sensor link   (Quick window fields: MAV_BLES / MAV_BLEF / MAV_BLEN)")
+        _bles = self.drone_variables.get("BLES")
+        _blef = self.drone_variables.get("BLEF")
+        _blen = self.drone_variables.get("BLEN")
+        print("   BLES   link right now      %s"
+              % (BLE_STATES.get(int(round(_bles)), "unknown %d" % int(round(_bles)))
+                 if _bles is not None else "(none yet)"))
+        print("   BLEF   last fetch outcome  %s"
+              % (BLE_FETCH_STATES.get(int(round(_blef)),
+                                      "unknown %d" % int(round(_blef)))
+                 if _blef is not None else "(none yet)"))
+        print("   BLEN   samples received    %s"
+              % (("%d" % int(round(_blen))) if _blen is not None else "(none yet)"))
+        print("")
+        print("  BLEF is the one to watch. BLES moves constantly during a cast --")
+        print("  the sensor is under water for most of it and 2.4 GHz does not")
+        print("  get out of water, so `disconnected` mid-cast is normal. BLEF is")
+        print("  sticky and only changes when a fetch finishes:")
+        for k in sorted(BLE_FETCH_STATES):
+            mark = " <== now" if (_blef is not None
+                                  and int(round(_blef)) == k) else ""
+            print("      %d  %-26s%s" % (k, BLE_FETCH_STATES[k], mark))
+        print("")
+        print("  BLEF 2 with BLEN below the cast's sample count means the")
+        print("  download was cut off. The Pi keeps and uploads what arrived")
+        print("  (code 16) rather than discarding it, so the cast is short, not")
+        print("  missing. A refetch replays the Pi's cache, which is all it has.")
+        print("")
 
     def _note_haucs_float(self, name, value):
         """083026: operator record for the Pi's HAUCS code and winch rail.
@@ -1267,6 +1334,39 @@ class haucs(mp_module.MPModule):
                         self.console.writeln(
                             "[haucs] replay inbound, DATA96 gate armed %.0fs"
                             % self._refetch_grace_sec)
+
+            elif nm == "BLEF":
+                # 092726: the fetch outcome, sticky on the Pi side, so a single
+                # transition line per cast is the whole story. Logged
+                # unconditionally rather than only on a fault: "complete cast"
+                # in haucs.log is what lets a later argument about missing data
+                # be settled from the log instead of from memory.
+                fs = int(round(value))
+                if fs != self._ble_last_fetch:
+                    self._ble_last_fetch = fs
+                    got = self.drone_variables.get("BLEN")
+                    self.console.writeln(
+                        "[haucs] BLE fetch: %s%s"
+                        % (BLE_FETCH_STATES.get(fs, "unknown state %d" % fs),
+                           "" if got is None else ", %d samples received"
+                           % int(round(got))))
+                    if fs in (2, 5):
+                        self.console.writeln(
+                            "[haucs] cast is incomplete on the Pi as well -- "
+                            "`haucs winch refetch` replays the cache but cannot "
+                            "recover samples the sensor never sent")
+
+            elif nm == "BLES":
+                # Link state moves around constantly during a cast, so only the
+                # states an operator can act on are worth a line.
+                ls = int(round(value))
+                if ls != self._ble_last_link:
+                    prev = self._ble_last_link
+                    self._ble_last_link = ls
+                    if ls in (2, 3, 9) or prev in (2, 3, 9):
+                        self.console.writeln(
+                            "[haucs] BLE link: %s"
+                            % BLE_STATES.get(ls, "unknown state %d" % ls))
 
             elif nm == "WAMP":
                 # Latched so a sustained stall logs once, not at 2 Hz.
