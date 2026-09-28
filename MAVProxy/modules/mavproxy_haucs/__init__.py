@@ -1664,7 +1664,20 @@ class haucs(mp_module.MPModule):
                 'lat': lat, 'lng': lng,
                 'type': 'winch',
                 'do': do_array, 'temp': temp_array, 'pressure': pres_array,
-                'init_do': init_DO, 'init_pressure': init_pressure,
+                # 092826: was 'init_do': init_DO, the sensor's RAW count (~4121).
+                # The DO samples are already normalised saturation ratios
+                # (0.2-0.6 here), so a consumer that divides by init_do scales
+                # this cast down by 4121x. That is exactly what the pond_3d view
+                # shows: the 092726 18:32 cast renders at 0.0008 mg/L against
+                # 3.36 for the 18:52 cast, which was uploaded by
+                # upload_cached_samples.py with the truck convention.
+                #
+                # firebase_worker.py has hardcoded init_do = 1 on the truck path
+                # for this reason since the beginning; this path never matched
+                # it. The raw count is kept under init_do_raw so nothing is lost.
+                'init_do': 1,
+                'init_do_raw': init_DO,
+                'init_pressure': init_pressure,
                 'batt_v': batt_v,
                 # 081326: so a consumer can tell a whole cast from a gappy one
                 'complete': bool(complete),
